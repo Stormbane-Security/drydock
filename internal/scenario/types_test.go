@@ -217,6 +217,110 @@ commands:
 	}
 }
 
+func TestLoad_WithFixture(t *testing.T) {
+	yaml := `
+name: fixture-test
+fixture:
+  module: ./fixtures/gcp
+  vars:
+    project_id: test-proj
+    region: us-central1
+backend:
+  type: github-actions
+  repo: org/repo
+  workflow: ci.yml
+commands:
+  - name: check
+    run: echo ok
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scenario.yaml")
+	os.WriteFile(path, []byte(yaml), 0o644)
+
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if s.Fixture == nil {
+		t.Fatal("expected fixture to be parsed")
+	}
+	if s.Fixture.Module != "./fixtures/gcp" {
+		t.Errorf("expected fixture module './fixtures/gcp', got %q", s.Fixture.Module)
+	}
+	if s.Fixture.Vars["project_id"] != "test-proj" {
+		t.Error("expected fixture vars.project_id = test-proj")
+	}
+}
+
+func TestValidate_FixtureRequiresModule(t *testing.T) {
+	s := &Scenario{
+		Name:    "test",
+		Fixture: &Fixture{},
+		Backend: Backend{Type: "github-actions", Repo: "org/repo", Workflow: "ci.yml"},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err == nil {
+		t.Error("expected error for fixture without module")
+	}
+}
+
+func TestValidate_FixtureOptional(t *testing.T) {
+	s := &Scenario{
+		Name:    "test",
+		Backend: Backend{Type: "compose", ComposeFile: "compose.yaml"},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("expected no error without fixture, got: %v", err)
+	}
+}
+
+func TestValidate_GitHubActionsBackend(t *testing.T) {
+	s := &Scenario{
+		Name:    "test",
+		Backend: Backend{Type: "github-actions", Repo: "org/repo", Workflow: "ci.yml"},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("expected valid, got: %v", err)
+	}
+}
+
+func TestValidate_GitHubActionsRequiresRepo(t *testing.T) {
+	s := &Scenario{
+		Name:    "test",
+		Backend: Backend{Type: "github-actions", Workflow: "ci.yml"},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err == nil {
+		t.Error("expected error for github-actions without repo")
+	}
+}
+
+func TestValidate_GitHubActionsRequiresWorkflow(t *testing.T) {
+	s := &Scenario{
+		Name:    "test",
+		Backend: Backend{Type: "github-actions", Repo: "org/repo"},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err == nil {
+		t.Error("expected error for github-actions without workflow")
+	}
+}
+
+func TestValidate_GitHubAssertionTypes(t *testing.T) {
+	for _, typ := range []string{"github-run", "github-job", "github-step", "github-artifact"} {
+		s := &Scenario{
+			Name:    "test",
+			Backend: Backend{Type: "compose", ComposeFile: "compose.yaml"},
+			Assertions: []Assertion{{Name: "check", Type: typ}},
+		}
+		if err := s.Validate(); err != nil {
+			t.Errorf("expected %s assertion type to be valid, got: %v", typ, err)
+		}
+	}
+}
+
 func TestValidate_AssertionsOnly(t *testing.T) {
 	s := &Scenario{
 		Name:    "assertions-only",
