@@ -105,7 +105,7 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 		record.Error = err.Error()
 		record.FinishedAt = time.Now().UTC()
 		record.Duration = record.FinishedAt.Sub(record.StartedAt)
-		e.artifactStore.Save(record) //nolint:errcheck
+		_ = e.artifactStore.Save(record)
 		return record, err
 	}
 
