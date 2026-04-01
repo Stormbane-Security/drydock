@@ -790,6 +790,121 @@ func TestLoadDir_NonexistentDir(t *testing.T) {
 	}
 }
 
+func TestLoadDir_RecursesIntoSubdirectories(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "databases")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	scenario1 := `
+name: redis-test
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+assertions:
+  - name: check
+    type: port
+    target: "localhost:6379"
+    expect:
+      open: true
+`
+	scenario2 := `
+name: postgres-test
+services:
+  pg:
+    image: postgres:16
+    ports: ["5432:5432"]
+assertions:
+  - name: check
+    type: port
+    target: "localhost:5432"
+    expect:
+      open: true
+`
+	_ = os.WriteFile(filepath.Join(sub, "redis.yaml"), []byte(scenario1), 0o644)
+	_ = os.WriteFile(filepath.Join(sub, "postgres.yaml"), []byte(scenario2), 0o644)
+
+	scenarios, err := LoadDir(root)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	if len(scenarios) != 2 {
+		t.Errorf("expected 2 scenarios from nested dir, got %d", len(scenarios))
+	}
+}
+
+func TestLoadDir_SkipsSupportDirectories(t *testing.T) {
+	// Simulates: envoy.yaml (scenario) + envoy/ (config dir with non-scenario yaml)
+	root := t.TempDir()
+
+	scenarioYAML := `
+name: envoy-test
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.29-latest
+    ports: ["9901:9901"]
+assertions:
+  - name: check
+    type: port
+    target: "localhost:9901"
+    expect:
+      open: true
+`
+	_ = os.WriteFile(filepath.Join(root, "envoy.yaml"), []byte(scenarioYAML), 0o644)
+
+	// Create support directory with a non-scenario YAML config file.
+	supportDir := filepath.Join(root, "envoy")
+	if err := os.MkdirAll(supportDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(supportDir, "envoy.yaml"), []byte("admin:\n  address:\n    socket_address: { address: 0.0.0.0, port_value: 9901 }"), 0o644)
+
+	scenarios, err := LoadDir(root)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	if len(scenarios) != 1 {
+		t.Errorf("expected 1 scenario (support dir skipped), got %d", len(scenarios))
+	}
+	if scenarios[0].Name != "envoy-test" {
+		t.Errorf("expected scenario name 'envoy-test', got %q", scenarios[0].Name)
+	}
+}
+
+func TestLoadDir_DeepNesting(t *testing.T) {
+	// tests/category/subcategory/scenario.yaml — three levels deep
+	root := t.TempDir()
+	deep := filepath.Join(root, "infra", "gcp")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	content := `
+name: gcp-test
+services:
+  app:
+    image: nginx
+    ports: ["8080:80"]
+assertions:
+  - name: check
+    type: port
+    target: "localhost:8080"
+    expect:
+      open: true
+`
+	_ = os.WriteFile(filepath.Join(deep, "compute.yaml"), []byte(content), 0o644)
+
+	scenarios, err := LoadDir(root)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	if len(scenarios) != 1 {
+		t.Errorf("expected 1 scenario from deep nesting, got %d", len(scenarios))
+	}
+}
+
 // ── Validate command fields ───────────────────────────────────────────────
 
 func TestValidate_CommandMissingName(t *testing.T) {

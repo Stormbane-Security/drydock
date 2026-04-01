@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -451,6 +452,20 @@ func LoadDir(dir string) ([]*Scenario, error) {
 		return nil, fmt.Errorf("reading scenario directory: %w", err)
 	}
 
+	// Index YAML files so we can identify support directories (e.g. envoy/
+	// sitting next to envoy.yaml is a volume-mount directory, not a scenario dir).
+	yamlBases := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if ext == ".yaml" || ext == ".yml" {
+			yamlBases[strings.TrimSuffix(name, ext)] = true
+		}
+	}
+
 	var scenarios []*Scenario
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -462,6 +477,12 @@ func LoadDir(dir string) ([]*Scenario, error) {
 					return nil, err
 				}
 				scenarios = append(scenarios, s)
+				continue
+			}
+			// Skip support directories that share a name with a sibling
+			// YAML file (e.g. envoy/ alongside envoy.yaml contains config
+			// files mounted as volumes, not scenarios).
+			if yamlBases[entry.Name()] {
 				continue
 			}
 			// Recurse into subdirectories to support nested layouts
