@@ -191,7 +191,7 @@ func TestCheckTerraformOutput_Missing(t *testing.T) {
 
 func TestCheckFile_Exists(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "test.txt"), []byte("content here"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "test.txt"), []byte("content here"), 0o644)
 
 	exists := true
 	a := scenario.Assertion{
@@ -208,7 +208,7 @@ func TestCheckFile_Exists(t *testing.T) {
 
 func TestCheckFile_Contains(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "main.tf"), []byte("resource \"aws_s3_bucket\" {\n  encryption {\n  }\n}"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "main.tf"), []byte("resource \"aws_s3_bucket\" {\n  encryption {\n  }\n}"), 0o644)
 
 	a := scenario.Assertion{
 		Name:   "has-encryption",
@@ -251,7 +251,7 @@ cat <<'JSONEOF'
 JSONEOF
 `
 	scriptPath := filepath.Join(dir, "beacon")
-	os.WriteFile(scriptPath, []byte(script), 0o755)
+	_ = os.WriteFile(scriptPath, []byte(script), 0o755)
 
 	a := scenario.Assertion{
 		Name:   "cert-expiry-detected",
@@ -276,7 +276,7 @@ cat <<'JSONEOF'
 [{"check_id":"headers.missing_hsts","severity":"medium","title":"Missing HSTS","asset":"example.com","evidence":{}}]
 JSONEOF
 `
-	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
 
 	a := scenario.Assertion{
 		Name:   "no-cert-expiry",
@@ -300,7 +300,7 @@ func TestCheckBeacon_NotCheckID(t *testing.T) {
 	script := `#!/bin/sh
 echo '[]'
 `
-	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
 
 	a := scenario.Assertion{
 		Name:   "cors-fixed",
@@ -323,7 +323,7 @@ cat <<'JSONEOF'
 [{"check_id":"supply_chain.vulnerable_dependency","severity":"high","title":"Vulnerable dep","asset":"app.example.com","evidence":{"package":"express","version":"4.17.1","cve_id":"CVE-2024-29041"}}]
 JSONEOF
 `
-	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
 
 	a := scenario.Assertion{
 		Name:   "express-cve",
@@ -346,7 +346,7 @@ func TestCheckBeacon_MinFindings(t *testing.T) {
 	script := `#!/bin/sh
 echo '[{"check_id":"a","severity":"low","title":"a","asset":"x","evidence":{}}]'
 `
-	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
 
 	min := 3
 	a := scenario.Assertion{
@@ -367,7 +367,7 @@ func TestCheckBeacon_WrapperFormat(t *testing.T) {
 	script := `#!/bin/sh
 echo '{"findings":[{"check_id":"tls.weak_cipher","severity":"medium","title":"Weak Cipher","asset":"x","evidence":{}}]}'
 `
-	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
 
 	a := scenario.Assertion{
 		Name:   "wrapper-format",
