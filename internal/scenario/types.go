@@ -35,6 +35,10 @@ type Scenario struct {
 	// Defaults to 10m if unset.
 	Timeout Duration `yaml:"timeout,omitempty"`
 
+	// Fixture optionally provisions prerequisite infrastructure (always Terraform).
+	// Its outputs are interpolated into the rest of the scenario as ${fixture.<output>}.
+	Fixture *Fixture `yaml:"fixture,omitempty"`
+
 	// Artifacts configures what to collect after the run.
 	Artifacts ArtifactConfig `yaml:"artifacts,omitempty"`
 
@@ -91,6 +95,20 @@ type Backend struct {
 
 	// Inputs are key-value pairs passed to the workflow_dispatch event.
 	Inputs map[string]string `yaml:"inputs,omitempty"`
+}
+
+// Fixture provisions prerequisite cloud infrastructure before the main backend.
+// It is always a Terraform module. Its outputs are available for interpolation
+// via ${fixture.<output_name>} in the rest of the scenario.
+type Fixture struct {
+	// Module is the path to the Terraform module (relative to scenario dir).
+	Module string `yaml:"module"`
+
+	// Vars are variables passed to terraform apply -var.
+	Vars map[string]string `yaml:"vars,omitempty"`
+
+	// Workspace overrides the Terraform workspace. Defaults to "drydock-fixture-<scenario-name>".
+	Workspace string `yaml:"workspace,omitempty"`
 }
 
 // Command is a single step to execute.
@@ -244,6 +262,11 @@ func Load(path string) (*Scenario, error) {
 func (s *Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("scenario name is required")
+	}
+	if s.Fixture != nil {
+		if s.Fixture.Module == "" {
+			return fmt.Errorf("fixture.module is required when fixture is specified")
+		}
 	}
 	if s.Backend.Type == "" {
 		return fmt.Errorf("backend.type is required")
