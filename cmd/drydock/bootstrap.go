@@ -39,7 +39,7 @@ Supported providers: gcp, aws, all`)
 		return strings.HasPrefix(strings.ToLower(answer), "y")
 	}
 
-	provider := "all"
+	var provider string
 	if len(args) > 0 {
 		provider = args[0]
 	} else {
@@ -70,7 +70,7 @@ EOF`,
 			"mkdir -p .github/workflows",
 			`git add -A && git commit -m "chore: initial test repo for Drydock"`,
 			"git push origin main",
-			fmt.Sprintf("cd .."),
+			"cd ..",
 			"",
 		)
 	}
