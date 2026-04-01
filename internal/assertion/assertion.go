@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -79,7 +80,11 @@ func checkHTTP(ctx context.Context, a scenario.Assertion) artifact.AssertionResu
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		result.Message = fmt.Sprintf("failed to read response body: %v", err)
+		return result
+	}
 
 	// Check status code.
 	if a.Expect.Status != nil && resp.StatusCode != *a.Expect.Status {
@@ -222,8 +227,13 @@ func checkTerraformOutput(a scenario.Assertion, outputs map[string]string) artif
 func checkFile(a scenario.Assertion, baseDir string) artifact.AssertionResult {
 	result := artifact.AssertionResult{}
 	path := a.Target
-	if baseDir != "" && !strings.HasPrefix(path, "/") {
-		path = baseDir + "/" + path
+	if baseDir != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, filepath.Clean(path))
+		// Prevent path traversal outside baseDir.
+		if !strings.HasPrefix(path, filepath.Clean(baseDir)+string(filepath.Separator)) && path != filepath.Clean(baseDir) {
+			result.Message = fmt.Sprintf("path %q traverses outside base directory", a.Target)
+			return result
+		}
 	}
 
 	_, err := os.Stat(path)
@@ -281,13 +291,10 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		return result
 	}
 
-	// Run beacon scan and capture JSON output.
-	extraArgs := ""
-	if len(a.Args) > 0 {
-		extraArgs = " " + strings.Join(a.Args, " ")
-	}
-	cmd := fmt.Sprintf("beacon scan %s --format json --skip-enrichment%s 2>/dev/null", a.Target, extraArgs)
-	r := runner.Run(ctx, "beacon-scan", cmd, baseDir, env)
+	// Run beacon scan with proper argument separation (no shell injection).
+	argv := []string{"beacon", "scan", a.Target, "--format", "json", "--skip-enrichment"}
+	argv = append(argv, a.Args...)
+	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result
@@ -408,9 +415,9 @@ func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, en
 		return result
 	}
 
-	// Run beacon classify and capture JSON output.
-	cmd := fmt.Sprintf("beacon classify %s --format json 2>/dev/null", a.Target)
-	r := runner.Run(ctx, "beacon-classify", cmd, baseDir, env)
+	// Run beacon classify with proper argument separation (no shell injection).
+	argv := []string{"beacon", "classify", a.Target, "--format", "json"}
+	r := runner.RunExec(ctx, "beacon-classify", argv, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon classify failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result
