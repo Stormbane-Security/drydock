@@ -17,7 +17,7 @@ func TestCheckHTTP_StatusOK(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Custom", "test-value")
 		w.WriteHeader(200)
-		w.Write([]byte("hello world"))
+		_, _ = w.Write([]byte("hello world"))
 	}))
 	defer ts.Close()
 
@@ -62,7 +62,7 @@ func TestCheckHTTP_WrongStatus(t *testing.T) {
 
 func TestCheckHTTP_BodyNotContains(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("error message"))
+		_, _ = w.Write([]byte("error message"))
 	}))
 	defer ts.Close()
 

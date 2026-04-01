@@ -40,7 +40,7 @@ func (e *Engine) SetOutput(w io.Writer) {
 }
 
 func (e *Engine) log(format string, args ...any) {
-	fmt.Fprintf(e.out, "drydock: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(e.out, "drydock: "+format+"\n", args...)
 }
 
 // Run executes a full scenario lifecycle and returns the run record.

@@ -98,14 +98,8 @@ func (b *Backend) createViaPush(ctx context.Context) error {
 
 	beforeTime := time.Now().UTC()
 
-	// Create the test branch.
+	// Create the test branch via stdin payload.
 	payload := fmt.Sprintf(`{"ref":"refs/heads/%s","sha":"%s"}`, b.testBranch, sha)
-	_, stderr, err = b.gh(ctx, "api",
-		fmt.Sprintf("repos/%s/git/refs", b.repo),
-		"--method", "POST",
-		"--input", "-",
-		"--silent")
-	// Retry with raw input since --input reads from stdin.
 	cmd := exec.CommandContext(ctx, "gh", "api",
 		fmt.Sprintf("repos/%s/git/refs", b.repo),
 		"--method", "POST",

@@ -75,7 +75,7 @@ func checkHTTP(ctx context.Context, a scenario.Assertion) artifact.AssertionResu
 		result.Message = fmt.Sprintf("HTTP request failed: %v", err)
 		return result
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
@@ -121,7 +121,7 @@ func checkPort(ctx context.Context, a scenario.Assertion) artifact.AssertionResu
 	conn, err := net.DialTimeout("tcp", a.Target, 5*time.Second)
 	isOpen := err == nil
 	if conn != nil {
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	expectOpen := true

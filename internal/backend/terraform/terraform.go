@@ -161,8 +161,8 @@ func (b *Backend) Destroy(ctx context.Context) error {
 
 	// Clean up workspace if we created one.
 	if b.workspace != "" {
-		b.run(ctx, "workspace", "select", "default")
-		b.run(ctx, "workspace", "delete", b.workspace)
+		_, _, _ = b.run(ctx, "workspace", "select", "default")
+		_, _, _ = b.run(ctx, "workspace", "delete", b.workspace)
 	}
 
 	return nil

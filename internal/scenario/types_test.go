@@ -90,7 +90,7 @@ commands:
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "scenario.yaml")
-	os.WriteFile(path, []byte(yaml), 0o644)
+	_ = os.WriteFile(path, []byte(yaml), 0o644)
 
 	s, err := Load(path)
 	if err != nil {
@@ -188,7 +188,7 @@ func TestLoadDir(t *testing.T) {
 
 	// Create a scenario in a subdirectory.
 	subDir := filepath.Join(dir, "my-test")
-	os.MkdirAll(subDir, 0o755)
+	_ = os.MkdirAll(subDir, 0o755)
 	yaml := `name: sub-test
 backend:
   type: compose
@@ -196,7 +196,7 @@ backend:
 commands:
   - name: test
     run: echo ok`
-	os.WriteFile(filepath.Join(subDir, "scenario.yaml"), []byte(yaml), 0o644)
+	_ = os.WriteFile(filepath.Join(subDir, "scenario.yaml"), []byte(yaml), 0o644)
 
 	// Create a scenario as a top-level YAML file.
 	yaml2 := `name: top-test
@@ -206,7 +206,7 @@ backend:
 commands:
   - name: test
     run: echo ok`
-	os.WriteFile(filepath.Join(dir, "top.yaml"), []byte(yaml2), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "top.yaml"), []byte(yaml2), 0o644)
 
 	scenarios, err := LoadDir(dir)
 	if err != nil {
@@ -235,7 +235,7 @@ commands:
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "scenario.yaml")
-	os.WriteFile(path, []byte(yaml), 0o644)
+	_ = os.WriteFile(path, []byte(yaml), 0o644)
 
 	s, err := Load(path)
 	if err != nil {
