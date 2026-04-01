@@ -41,6 +41,14 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkFile(a, baseDir)
 		case "beacon":
 			result = checkBeacon(ctx, a, baseDir, env)
+		case "github-run":
+			result = checkGitHubRun(a, outputs)
+		case "github-job":
+			result = checkGitHubJob(a, outputs)
+		case "github-step":
+			result = checkGitHubStep(a, outputs)
+		case "github-artifact":
+			result = checkGitHubArtifact(a, outputs)
 		default:
 			result.Message = fmt.Sprintf("unsupported assertion type: %s", a.Type)
 		}
@@ -361,6 +369,110 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		detail += fmt.Sprintf(", %s absent", a.Expect.NotCheckID)
 	}
 	result.Message = detail
+	return result
+}
+
+// ── GitHub Actions assertions ─────────────────────────────────────────────
+
+func checkGitHubRun(a scenario.Assertion, outputs map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+	if a.Expect.Conclusion == "" {
+		result.Message = "expect.conclusion is required for github-run assertions"
+		return result
+	}
+
+	actual, ok := outputs["run.conclusion"]
+	if !ok {
+		result.Message = "run.conclusion not found in outputs (workflow may not have completed)"
+		return result
+	}
+
+	if actual != a.Expect.Conclusion {
+		result.Message = fmt.Sprintf("run conclusion: expected %q, got %q", a.Expect.Conclusion, actual)
+		return result
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("run conclusion = %s", actual)
+	return result
+}
+
+func checkGitHubJob(a scenario.Assertion, outputs map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+	if a.Expect.Job == "" {
+		result.Message = "expect.job is required for github-job assertions"
+		return result
+	}
+	if a.Expect.Conclusion == "" {
+		result.Message = "expect.conclusion is required for github-job assertions"
+		return result
+	}
+
+	key := "job." + a.Expect.Job + ".conclusion"
+	actual, ok := outputs[key]
+	if !ok {
+		result.Message = fmt.Sprintf("job %q not found in outputs", a.Expect.Job)
+		return result
+	}
+
+	if actual != a.Expect.Conclusion {
+		result.Message = fmt.Sprintf("job %s conclusion: expected %q, got %q", a.Expect.Job, a.Expect.Conclusion, actual)
+		return result
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("job %s conclusion = %s", a.Expect.Job, actual)
+	return result
+}
+
+func checkGitHubStep(a scenario.Assertion, outputs map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+	if a.Expect.Job == "" {
+		result.Message = "expect.job is required for github-step assertions"
+		return result
+	}
+	if a.Expect.StepName == "" {
+		result.Message = "expect.step_name is required for github-step assertions"
+		return result
+	}
+	if a.Expect.Conclusion == "" {
+		result.Message = "expect.conclusion is required for github-step assertions"
+		return result
+	}
+
+	key := "job." + a.Expect.Job + ".step." + a.Expect.StepName + ".conclusion"
+	actual, ok := outputs[key]
+	if !ok {
+		result.Message = fmt.Sprintf("step %s in job %s not found in outputs", a.Expect.StepName, a.Expect.Job)
+		return result
+	}
+
+	if actual != a.Expect.Conclusion {
+		result.Message = fmt.Sprintf("step %s conclusion: expected %q, got %q", a.Expect.StepName, a.Expect.Conclusion, actual)
+		return result
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("step %s conclusion = %s", a.Expect.StepName, actual)
+	return result
+}
+
+func checkGitHubArtifact(a scenario.Assertion, outputs map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+	if a.Expect.ArtifactName == "" {
+		result.Message = "expect.artifact_name is required for github-artifact assertions"
+		return result
+	}
+
+	key := "artifact." + a.Expect.ArtifactName
+	_, ok := outputs[key]
+	if !ok {
+		result.Message = fmt.Sprintf("artifact %q not found", a.Expect.ArtifactName)
+		return result
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("artifact %s present", a.Expect.ArtifactName)
 	return result
 }
 

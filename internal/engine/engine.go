@@ -13,6 +13,7 @@ import (
 	"github.com/stormbane-security/drydock/internal/assertion"
 	"github.com/stormbane-security/drydock/internal/backend"
 	"github.com/stormbane-security/drydock/internal/backend/compose"
+	"github.com/stormbane-security/drydock/internal/backend/ghactions"
 	tf "github.com/stormbane-security/drydock/internal/backend/terraform"
 	"github.com/stormbane-security/drydock/internal/runner"
 	"github.com/stormbane-security/drydock/internal/scenario"
@@ -263,6 +264,12 @@ func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error)
 			}
 			backends = append(backends, tf.New(s.Dir, s.Backend.TerraformDir, s.Backend.TerraformVars, workspace, autoApprove, s.Env))
 		}
+	case "github-actions":
+		ref := s.Backend.Ref
+		if ref == "" {
+			ref = "main"
+		}
+		backends = append(backends, ghactions.New(s.Backend.Repo, s.Backend.Workflow, ref, s.Backend.Trigger, s.Backend.Inputs, s.Env))
 	default:
 		return nil, fmt.Errorf("unsupported backend type: %q", s.Backend.Type)
 	}

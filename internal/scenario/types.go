@@ -73,6 +73,24 @@ type Backend struct {
 
 	// Workspace is the Terraform workspace name. Defaults to "drydock-<scenario-name>".
 	Workspace string `yaml:"workspace,omitempty"`
+
+	// ── GitHub Actions backend ──────────────────────────────────────────
+
+	// Repo is the GitHub repository (owner/name) for the workflow.
+	// Required when Type is "github-actions".
+	Repo string `yaml:"repo,omitempty"`
+
+	// Workflow is the workflow filename or ID to trigger.
+	Workflow string `yaml:"workflow,omitempty"`
+
+	// Ref is the git ref (branch/tag) to run against. Defaults to the repo's default branch.
+	Ref string `yaml:"ref,omitempty"`
+
+	// Trigger selects how to start the run: "workflow_dispatch" (default) or "push".
+	Trigger string `yaml:"trigger,omitempty"`
+
+	// Inputs are key-value pairs passed to the workflow_dispatch event.
+	Inputs map[string]string `yaml:"inputs,omitempty"`
 }
 
 // Command is a single step to execute.
@@ -163,6 +181,12 @@ type AssertionExpect struct {
 	MaxFindings   *int   `yaml:"max_findings,omitempty"`    // maximum number of findings expected
 	EvidenceKey   string `yaml:"evidence_key,omitempty"`    // key in evidence map to check
 	EvidenceValue string `yaml:"evidence_value,omitempty"`  // expected value for evidence key
+
+	// GitHub Actions assertions
+	Conclusion   string `yaml:"conclusion,omitempty"`    // expected conclusion (success, failure, etc.)
+	Job          string `yaml:"job,omitempty"`           // job name to assert on
+	StepName     string `yaml:"step_name,omitempty"`     // step name within a job
+	ArtifactName string `yaml:"artifact_name,omitempty"` // artifact that should be present
 }
 
 // ArtifactConfig controls what gets collected after a run.
@@ -237,8 +261,15 @@ func (s *Scenario) Validate() error {
 		if s.Backend.ComposeFile == "" && s.Backend.TerraformDir == "" {
 			return fmt.Errorf("hybrid backend requires at least compose_file or terraform_dir")
 		}
+	case "github-actions":
+		if s.Backend.Repo == "" {
+			return fmt.Errorf("backend.repo is required for github-actions backend")
+		}
+		if s.Backend.Workflow == "" {
+			return fmt.Errorf("backend.workflow is required for github-actions backend")
+		}
 	default:
-		return fmt.Errorf("unsupported backend type: %q (use compose, terraform, or hybrid)", s.Backend.Type)
+		return fmt.Errorf("unsupported backend type: %q (use compose, terraform, hybrid, or github-actions)", s.Backend.Type)
 	}
 	if len(s.Commands) == 0 && len(s.Assertions) == 0 {
 		return fmt.Errorf("scenario must have at least one command or assertion")
@@ -256,7 +287,8 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file", "beacon":
+		case "http", "port", "command", "terraform", "file", "beacon",
+			"github-run", "github-job", "github-step", "github-artifact":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)
