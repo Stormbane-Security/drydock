@@ -292,7 +292,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan with proper argument separation (no shell injection).
-	argv := []string{"beacon", "scan", a.Target, "--format", "json", "--skip-enrichment"}
+	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--skip-enrichment"}
 	argv = append(argv, a.Args...)
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
