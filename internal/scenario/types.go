@@ -462,7 +462,15 @@ func LoadDir(dir string) ([]*Scenario, error) {
 					return nil, err
 				}
 				scenarios = append(scenarios, s)
+				continue
 			}
+			// Recurse into subdirectories to support nested layouts
+			// like tests/databases/redis.yaml.
+			sub, err := LoadDir(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			scenarios = append(scenarios, sub...)
 			continue
 		}
 		name := entry.Name()
