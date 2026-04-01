@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stormbane-security/drydock/internal/artifact"
@@ -233,6 +234,150 @@ func TestCheckFile_NotExists(t *testing.T) {
 	result := checkFile(a, dir)
 	if result.Passed {
 		t.Error("expected fail for missing file")
+	}
+}
+
+// ── Beacon assertion unit tests ──────────────────────────────────────────
+
+// These test the beacon finding parsing and matching logic by mocking
+// the beacon binary with a shell script that outputs known JSON.
+
+func TestCheckBeacon_FindingPresent(t *testing.T) {
+	dir := t.TempDir()
+	// Create a fake "beacon" script that outputs a known finding.
+	script := `#!/bin/sh
+cat <<'JSONEOF'
+[{"check_id":"tls.cert_expiry_7d","severity":"high","title":"Certificate Expires in 7 Days","asset":"api.example.com","evidence":{"expiry_date":"2026-04-07"}}]
+JSONEOF
+`
+	scriptPath := filepath.Join(dir, "beacon")
+	os.WriteFile(scriptPath, []byte(script), 0o755)
+
+	a := scenario.Assertion{
+		Name:   "cert-expiry-detected",
+		Type:   "beacon",
+		Target: "api.example.com",
+		Expect: scenario.AssertionExpect{
+			CheckID:  "tls.cert_expiry_7d",
+			Severity: "high",
+		},
+	}
+	// Prepend our temp dir to PATH so "beacon" resolves to our script.
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckBeacon_FindingAbsent(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat <<'JSONEOF'
+[{"check_id":"headers.missing_hsts","severity":"medium","title":"Missing HSTS","asset":"example.com","evidence":{}}]
+JSONEOF
+`
+	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+
+	a := scenario.Assertion{
+		Name:   "no-cert-expiry",
+		Type:   "beacon",
+		Target: "example.com",
+		Expect: scenario.AssertionExpect{
+			CheckID: "tls.cert_expiry_7d",
+		},
+	}
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if result.Passed {
+		t.Error("expected fail when finding not present")
+	}
+	if !strings.Contains(result.Message, "not found") {
+		t.Errorf("expected 'not found' message, got: %s", result.Message)
+	}
+}
+
+func TestCheckBeacon_NotCheckID(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+echo '[]'
+`
+	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+
+	a := scenario.Assertion{
+		Name:   "cors-fixed",
+		Type:   "beacon",
+		Target: "api.example.com",
+		Expect: scenario.AssertionExpect{
+			NotCheckID: "web.cors_misconfiguration",
+		},
+	}
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if !result.Passed {
+		t.Errorf("expected pass when finding absent, got: %s", result.Message)
+	}
+}
+
+func TestCheckBeacon_EvidenceMatch(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+cat <<'JSONEOF'
+[{"check_id":"supply_chain.vulnerable_dependency","severity":"high","title":"Vulnerable dep","asset":"app.example.com","evidence":{"package":"express","version":"4.17.1","cve_id":"CVE-2024-29041"}}]
+JSONEOF
+`
+	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+
+	a := scenario.Assertion{
+		Name:   "express-cve",
+		Type:   "beacon",
+		Target: "app.example.com",
+		Expect: scenario.AssertionExpect{
+			CheckID:       "supply_chain.vulnerable_dependency",
+			EvidenceKey:   "cve_id",
+			EvidenceValue: "CVE-2024-29041",
+		},
+	}
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckBeacon_MinFindings(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+echo '[{"check_id":"a","severity":"low","title":"a","asset":"x","evidence":{}}]'
+`
+	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+
+	min := 3
+	a := scenario.Assertion{
+		Name:   "enough-findings",
+		Type:   "beacon",
+		Target: "x",
+		Expect: scenario.AssertionExpect{MinFindings: &min},
+	}
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if result.Passed {
+		t.Error("expected fail when fewer findings than min")
+	}
+}
+
+func TestCheckBeacon_WrapperFormat(t *testing.T) {
+	dir := t.TempDir()
+	// Beacon may output findings inside a wrapper object.
+	script := `#!/bin/sh
+echo '{"findings":[{"check_id":"tls.weak_cipher","severity":"medium","title":"Weak Cipher","asset":"x","evidence":{}}]}'
+`
+	os.WriteFile(filepath.Join(dir, "beacon"), []byte(script), 0o755)
+
+	a := scenario.Assertion{
+		Name:   "wrapper-format",
+		Type:   "beacon",
+		Target: "x",
+		Expect: scenario.AssertionExpect{CheckID: "tls.weak_cipher"},
+	}
+	result := checkBeacon(context.Background(), a, dir, map[string]string{"PATH": dir + ":" + os.Getenv("PATH")})
+	if !result.Passed {
+		t.Errorf("expected pass with wrapper format, got: %s", result.Message)
 	}
 }
 

@@ -5,6 +5,7 @@ package assertion
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -38,6 +39,8 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkTerraformOutput(a, outputs)
 		case "file":
 			result = checkFile(a, baseDir)
+		case "beacon":
+			result = checkBeacon(ctx, a, baseDir, env)
 		default:
 			result.Message = fmt.Sprintf("unsupported assertion type: %s", a.Type)
 		}
@@ -245,6 +248,119 @@ func checkFile(a scenario.Assertion, baseDir string) artifact.AssertionResult {
 
 	result.Passed = true
 	result.Message = "file check passed"
+	return result
+}
+
+// ── Beacon assertion ─────────────────────────────────────────────────────
+
+// beaconFinding matches the JSON output structure of beacon scan --format json.
+type beaconFinding struct {
+	CheckID  string         `json:"check_id"`
+	Severity string         `json:"severity"`
+	Title    string         `json:"title"`
+	Asset    string         `json:"asset"`
+	Evidence map[string]any `json:"evidence"`
+}
+
+func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+
+	// Target is the scan target (hostname, IP, or URL).
+	if a.Target == "" {
+		result.Message = "target is required for beacon assertions (scan target)"
+		return result
+	}
+
+	// Run beacon scan and capture JSON output.
+	cmd := fmt.Sprintf("beacon scan %s --format json --skip-enrichment 2>/dev/null", a.Target)
+	r := runner.Run(ctx, "beacon-scan", cmd, baseDir, env)
+	if r.ExitCode != 0 && r.Stdout == "" {
+		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
+		return result
+	}
+
+	// Parse findings from JSON output.
+	var findings []beaconFinding
+	if err := json.Unmarshal([]byte(r.Stdout), &findings); err != nil {
+		// Try parsing as a wrapper object with a "findings" key.
+		var wrapper struct {
+			Findings []beaconFinding `json:"findings"`
+		}
+		if err2 := json.Unmarshal([]byte(r.Stdout), &wrapper); err2 != nil {
+			result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
+			return result
+		}
+		findings = wrapper.Findings
+	}
+
+	// Check min/max finding counts.
+	if a.Expect.MinFindings != nil && len(findings) < *a.Expect.MinFindings {
+		result.Message = fmt.Sprintf("expected at least %d findings, got %d", *a.Expect.MinFindings, len(findings))
+		return result
+	}
+	if a.Expect.MaxFindings != nil && len(findings) > *a.Expect.MaxFindings {
+		result.Message = fmt.Sprintf("expected at most %d findings, got %d", *a.Expect.MaxFindings, len(findings))
+		return result
+	}
+
+	// Check that a specific check_id is present.
+	if a.Expect.CheckID != "" {
+		found := false
+		for _, f := range findings {
+			if f.CheckID == a.Expect.CheckID {
+				found = true
+				// If severity is also specified, verify it matches.
+				if a.Expect.Severity != "" && f.Severity != a.Expect.Severity {
+					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.Severity, a.Expect.Severity)
+					return result
+				}
+				// If evidence key/value is specified, verify it.
+				if a.Expect.EvidenceKey != "" {
+					ev, ok := f.Evidence[a.Expect.EvidenceKey]
+					if !ok {
+						result.Message = fmt.Sprintf("finding %s missing evidence key %q", a.Expect.CheckID, a.Expect.EvidenceKey)
+						return result
+					}
+					if a.Expect.EvidenceValue != "" {
+						evStr := fmt.Sprintf("%v", ev)
+						if evStr != a.Expect.EvidenceValue {
+							result.Message = fmt.Sprintf("finding %s evidence %s=%q, expected %q", a.Expect.CheckID, a.Expect.EvidenceKey, evStr, a.Expect.EvidenceValue)
+							return result
+						}
+					}
+				}
+				break
+			}
+		}
+		if !found {
+			var foundIDs []string
+			for _, f := range findings {
+				foundIDs = append(foundIDs, f.CheckID)
+			}
+			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: %v", a.Expect.CheckID, len(findings), foundIDs)
+			return result
+		}
+	}
+
+	// Check that a specific check_id is NOT present.
+	if a.Expect.NotCheckID != "" {
+		for _, f := range findings {
+			if f.CheckID == a.Expect.NotCheckID {
+				result.Message = fmt.Sprintf("finding %s should not be present but was found: %s", a.Expect.NotCheckID, f.Title)
+				return result
+			}
+		}
+	}
+
+	result.Passed = true
+	detail := fmt.Sprintf("beacon scan completed: %d findings", len(findings))
+	if a.Expect.CheckID != "" {
+		detail += fmt.Sprintf(", %s present", a.Expect.CheckID)
+	}
+	if a.Expect.NotCheckID != "" {
+		detail += fmt.Sprintf(", %s absent", a.Expect.NotCheckID)
+	}
+	result.Message = detail
 	return result
 }
 

@@ -118,6 +118,7 @@ type Assertion struct {
 	//   "command"    — Run a command, check exit code/output
 	//   "terraform"  — Check terraform output values
 	//   "file"       — Check file exists/contains
+	//   "beacon"     — Run beacon scan, check for findings
 	Type string `yaml:"type"`
 
 	// Target is assertion-type-specific (URL for http, host:port for port, etc.)
@@ -153,6 +154,15 @@ type AssertionExpect struct {
 	// File assertions
 	Exists   *bool  `yaml:"exists,omitempty"`
 	Contains string `yaml:"contains,omitempty"`
+
+	// Beacon assertions
+	CheckID       string `yaml:"check_id,omitempty"`       // finding check ID to look for
+	NotCheckID    string `yaml:"not_check_id,omitempty"`    // finding check ID that must NOT appear
+	Severity      string `yaml:"severity,omitempty"`        // expected severity (critical, high, medium, low, info)
+	MinFindings   *int   `yaml:"min_findings,omitempty"`    // minimum number of findings expected
+	MaxFindings   *int   `yaml:"max_findings,omitempty"`    // maximum number of findings expected
+	EvidenceKey   string `yaml:"evidence_key,omitempty"`    // key in evidence map to check
+	EvidenceValue string `yaml:"evidence_value,omitempty"`  // expected value for evidence key
 }
 
 // ArtifactConfig controls what gets collected after a run.
@@ -246,7 +256,7 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file":
+		case "http", "port", "command", "terraform", "file", "beacon":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)
