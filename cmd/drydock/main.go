@@ -10,6 +10,7 @@
 //	drydock destroy <scenario-path>      Force-destroy a scenario's environment
 //	drydock inspect <run-id>             Show results of a previous run
 //	drydock list                         List all previous runs
+//	drydock bootstrap [provider]         Interactive setup for test infrastructure
 package main
 
 import (
@@ -48,6 +49,8 @@ func main() {
 		cmdInspect(args)
 	case "list":
 		cmdList()
+	case "bootstrap":
+		cmdBootstrap(args)
 	case "version":
 		fmt.Printf("drydock v%s\n", version)
 	case "help", "--help", "-h":
@@ -68,6 +71,7 @@ Usage:
   drydock destroy <path>               Tear down a scenario's environment
   drydock inspect <run-id>             Show results of a previous run
   drydock list                         List all previous runs
+  drydock bootstrap [gcp|aws|all]      Interactive setup for test infrastructure
   drydock version                      Print version
 
 Run flags:
