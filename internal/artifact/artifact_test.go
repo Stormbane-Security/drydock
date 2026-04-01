@@ -50,8 +50,8 @@ func TestStore_List(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
 
-	store.Save(&RunRecord{ID: "run-a", Status: "pass"})
-	store.Save(&RunRecord{ID: "run-b", Status: "fail"})
+	_ = store.Save(&RunRecord{ID: "run-a", Status: "pass"})
+	_ = store.Save(&RunRecord{ID: "run-b", Status: "fail"})
 
 	ids, err := store.List()
 	if err != nil {

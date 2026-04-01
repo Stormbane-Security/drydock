@@ -101,7 +101,7 @@ func cmdRun(args []string) {
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
 		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")

@@ -1,0 +1,10 @@
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  ci:
+    uses: stormbane-security/bosun/.github/workflows/go-ci.yml@main
+    with:
+      gosec-excludes: G204,G304

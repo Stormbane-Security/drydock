@@ -48,7 +48,7 @@ func NewStore(baseDir string) *Store {
 // Save writes a RunRecord to disk as JSON.
 func (s *Store) Save(record *RunRecord) error {
 	dir := filepath.Join(s.baseDir, record.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("creating artifact dir: %w", err)
 	}
 
@@ -57,19 +57,19 @@ func (s *Store) Save(record *RunRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshaling record: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "run.json"), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "run.json"), data, 0o600); err != nil {
 		return fmt.Errorf("writing run.json: %w", err)
 	}
 
 	// Write logs to individual files.
 	if len(record.Logs) > 0 {
 		logsDir := filepath.Join(dir, "logs")
-		if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		if err := os.MkdirAll(logsDir, 0o750); err != nil {
 			return fmt.Errorf("creating logs dir: %w", err)
 		}
 		for name, content := range record.Logs {
 			logFile := filepath.Join(logsDir, sanitizeFilename(name)+".log")
-			os.WriteFile(logFile, []byte(content), 0o644) //nolint:errcheck
+			_ = os.WriteFile(logFile, []byte(content), 0o600)
 		}
 	}
 
@@ -113,10 +113,10 @@ func (s *Store) List() ([]string, error) {
 // SaveFile writes an additional file into a run's artifact directory.
 func (s *Store) SaveFile(runID, name string, data []byte) error {
 	dir := filepath.Join(s.baseDir, runID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, sanitizeFilename(name)), data, 0o644)
+	return os.WriteFile(filepath.Join(dir, sanitizeFilename(name)), data, 0o600)
 }
 
 func sanitizeFilename(name string) string {

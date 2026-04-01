@@ -35,6 +35,10 @@ type Scenario struct {
 	// Defaults to 10m if unset.
 	Timeout Duration `yaml:"timeout,omitempty"`
 
+	// Fixture optionally provisions prerequisite infrastructure (always Terraform).
+	// Its outputs are interpolated into the rest of the scenario as ${fixture.<output>}.
+	Fixture *Fixture `yaml:"fixture,omitempty"`
+
 	// Artifacts configures what to collect after the run.
 	Artifacts ArtifactConfig `yaml:"artifacts,omitempty"`
 
@@ -72,6 +76,38 @@ type Backend struct {
 	AutoApprove *bool `yaml:"auto_approve,omitempty"`
 
 	// Workspace is the Terraform workspace name. Defaults to "drydock-<scenario-name>".
+	Workspace string `yaml:"workspace,omitempty"`
+
+	// ── GitHub Actions backend ──────────────────────────────────────────
+
+	// Repo is the GitHub repository (owner/name) for the workflow.
+	// Required when Type is "github-actions".
+	Repo string `yaml:"repo,omitempty"`
+
+	// Workflow is the workflow filename or ID to trigger.
+	Workflow string `yaml:"workflow,omitempty"`
+
+	// Ref is the git ref (branch/tag) to run against. Defaults to the repo's default branch.
+	Ref string `yaml:"ref,omitempty"`
+
+	// Trigger selects how to start the run: "workflow_dispatch" (default) or "push".
+	Trigger string `yaml:"trigger,omitempty"`
+
+	// Inputs are key-value pairs passed to the workflow_dispatch event.
+	Inputs map[string]string `yaml:"inputs,omitempty"`
+}
+
+// Fixture provisions prerequisite cloud infrastructure before the main backend.
+// It is always a Terraform module. Its outputs are available for interpolation
+// via ${fixture.<output_name>} in the rest of the scenario.
+type Fixture struct {
+	// Module is the path to the Terraform module (relative to scenario dir).
+	Module string `yaml:"module"`
+
+	// Vars are variables passed to terraform apply -var.
+	Vars map[string]string `yaml:"vars,omitempty"`
+
+	// Workspace overrides the Terraform workspace. Defaults to "drydock-fixture-<scenario-name>".
 	Workspace string `yaml:"workspace,omitempty"`
 }
 
@@ -163,6 +199,12 @@ type AssertionExpect struct {
 	MaxFindings   *int   `yaml:"max_findings,omitempty"`    // maximum number of findings expected
 	EvidenceKey   string `yaml:"evidence_key,omitempty"`    // key in evidence map to check
 	EvidenceValue string `yaml:"evidence_value,omitempty"`  // expected value for evidence key
+
+	// GitHub Actions assertions
+	Conclusion   string `yaml:"conclusion,omitempty"`    // expected conclusion (success, failure, etc.)
+	Job          string `yaml:"job,omitempty"`           // job name to assert on
+	StepName     string `yaml:"step_name,omitempty"`     // step name within a job
+	ArtifactName string `yaml:"artifact_name,omitempty"` // artifact that should be present
 }
 
 // ArtifactConfig controls what gets collected after a run.
@@ -192,7 +234,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 }
 
 func (d Duration) MarshalYAML() (any, error) {
-	return d.Duration.String(), nil
+	return d.String(), nil
 }
 
 // Load reads a scenario from a YAML file.
@@ -221,6 +263,11 @@ func (s *Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("scenario name is required")
 	}
+	if s.Fixture != nil {
+		if s.Fixture.Module == "" {
+			return fmt.Errorf("fixture.module is required when fixture is specified")
+		}
+	}
 	if s.Backend.Type == "" {
 		return fmt.Errorf("backend.type is required")
 	}
@@ -237,8 +284,15 @@ func (s *Scenario) Validate() error {
 		if s.Backend.ComposeFile == "" && s.Backend.TerraformDir == "" {
 			return fmt.Errorf("hybrid backend requires at least compose_file or terraform_dir")
 		}
+	case "github-actions":
+		if s.Backend.Repo == "" {
+			return fmt.Errorf("backend.repo is required for github-actions backend")
+		}
+		if s.Backend.Workflow == "" {
+			return fmt.Errorf("backend.workflow is required for github-actions backend")
+		}
 	default:
-		return fmt.Errorf("unsupported backend type: %q (use compose, terraform, or hybrid)", s.Backend.Type)
+		return fmt.Errorf("unsupported backend type: %q (use compose, terraform, hybrid, or github-actions)", s.Backend.Type)
 	}
 	if len(s.Commands) == 0 && len(s.Assertions) == 0 {
 		return fmt.Errorf("scenario must have at least one command or assertion")
@@ -256,7 +310,8 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file", "beacon":
+		case "http", "port", "command", "terraform", "file", "beacon",
+			"github-run", "github-job", "github-step", "github-artifact":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)

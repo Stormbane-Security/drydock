@@ -13,7 +13,9 @@ import (
 	"github.com/stormbane-security/drydock/internal/assertion"
 	"github.com/stormbane-security/drydock/internal/backend"
 	"github.com/stormbane-security/drydock/internal/backend/compose"
+	"github.com/stormbane-security/drydock/internal/backend/ghactions"
 	tf "github.com/stormbane-security/drydock/internal/backend/terraform"
+	"github.com/stormbane-security/drydock/internal/interpolate"
 	"github.com/stormbane-security/drydock/internal/runner"
 	"github.com/stormbane-security/drydock/internal/scenario"
 )
@@ -38,7 +40,7 @@ func (e *Engine) SetOutput(w io.Writer) {
 }
 
 func (e *Engine) log(format string, args ...any) {
-	fmt.Fprintf(e.out, "drydock: "+format+"\n", args...)
+	_, _ = fmt.Fprintf(e.out, "drydock: "+format+"\n", args...)
 }
 
 // Run executes a full scenario lifecycle and returns the run record.
@@ -56,6 +58,46 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 	ctx, cancel := context.WithTimeout(ctx, s.Timeout.Duration)
 	defer cancel()
 
+	// Phase 0: Create fixture (if present).
+	if s.Fixture != nil {
+		fixture := e.createFixture(s)
+
+		// Defer fixture destroy FIRST so it runs LAST (after backend destroy).
+		defer func() {
+			e.log("destroying fixture...")
+			destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer destroyCancel()
+			if err := fixture.Destroy(destroyCtx); err != nil {
+				e.log("warning: fixture destroy failed: %v", err)
+			}
+		}()
+
+		e.log("creating fixture (%s)...", s.Fixture.Module)
+		if err := fixture.Create(ctx); err != nil {
+			record.Status = "error"
+			record.Error = fmt.Sprintf("fixture create failed: %v", err)
+			e.finalize(record)
+			return record, fmt.Errorf("fixture create: %w", err)
+		}
+
+		e.log("collecting fixture outputs...")
+		fixtureOutputs, err := fixture.Outputs(ctx)
+		if err != nil {
+			record.Status = "error"
+			record.Error = fmt.Sprintf("fixture outputs failed: %v", err)
+			e.finalize(record)
+			return record, fmt.Errorf("fixture outputs: %w", err)
+		}
+
+		e.log("interpolating fixture variables (%d outputs)...", len(fixtureOutputs))
+		if err := interpolate.Scenario(s, fixtureOutputs); err != nil {
+			record.Status = "error"
+			record.Error = fmt.Sprintf("fixture interpolation failed: %v", err)
+			e.finalize(record)
+			return record, fmt.Errorf("fixture interpolation: %w", err)
+		}
+	}
+
 	// Create backend(s).
 	backends, err := e.createBackends(s)
 	if err != nil {
@@ -63,7 +105,7 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 		record.Error = err.Error()
 		record.FinishedAt = time.Now().UTC()
 		record.Duration = record.FinishedAt.Sub(record.StartedAt)
-		e.artifactStore.Save(record) //nolint:errcheck
+		_ = e.artifactStore.Save(record)
 		return record, err
 	}
 
@@ -222,6 +264,13 @@ func (e *Engine) Destroy(ctx context.Context, s *scenario.Scenario) error {
 			return fmt.Errorf("destroying %s: %w", b.Name(), err)
 		}
 	}
+	// Destroy fixture if present.
+	if s.Fixture != nil {
+		fixture := e.createFixture(s)
+		if err := fixture.Destroy(ctx); err != nil {
+			return fmt.Errorf("destroying fixture: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -263,11 +312,25 @@ func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error)
 			}
 			backends = append(backends, tf.New(s.Dir, s.Backend.TerraformDir, s.Backend.TerraformVars, workspace, autoApprove, s.Env))
 		}
+	case "github-actions":
+		ref := s.Backend.Ref
+		if ref == "" {
+			ref = "main"
+		}
+		backends = append(backends, ghactions.New(s.Backend.Repo, s.Backend.Workflow, ref, s.Backend.Trigger, s.Backend.Inputs, s.Env))
 	default:
 		return nil, fmt.Errorf("unsupported backend type: %q", s.Backend.Type)
 	}
 
 	return backends, nil
+}
+
+func (e *Engine) createFixture(s *scenario.Scenario) *tf.Backend {
+	workspace := s.Fixture.Workspace
+	if workspace == "" {
+		workspace = "drydock-fixture-" + s.Name
+	}
+	return tf.New(s.Dir, s.Fixture.Module, s.Fixture.Vars, workspace, true, s.Env)
 }
 
 func commandsToSpecs(commands []scenario.Command) []runner.CommandSpec {
