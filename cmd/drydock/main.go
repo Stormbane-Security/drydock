@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -104,6 +105,16 @@ func cmdValidate(args []string) {
 	fmt.Fprintf(os.Stderr, "drydock: %d scenario(s) validated\n", len(scenarios))
 }
 
+func requireDocker() {
+	if _, err := exec.LookPath("docker"); err != nil {
+		fatalf("docker not found in PATH — install Docker to run scenarios")
+	}
+	out, err := exec.Command("docker", "info").CombinedOutput()
+	if err != nil {
+		fatalf("docker is not running:\n%s", strings.TrimSpace(string(out)))
+	}
+}
+
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
@@ -114,6 +125,8 @@ func cmdRun(args []string) {
 	if fs.NArg() == 0 {
 		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")
 	}
+
+	requireDocker()
 
 	scenarios := loadScenarios(fs.Arg(0))
 
@@ -197,6 +210,8 @@ func cmdDebug(args []string) {
 	if len(args) == 0 {
 		fatalf("usage: drydock debug <scenario-path>")
 	}
+
+	requireDocker()
 
 	s, err := scenario.Load(args[0])
 	if err != nil {
