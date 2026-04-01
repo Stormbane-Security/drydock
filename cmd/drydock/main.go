@@ -109,9 +109,8 @@ func requireDocker() {
 	if _, err := exec.LookPath("docker"); err != nil {
 		fatalf("docker not found in PATH — install Docker to run scenarios")
 	}
-	out, err := exec.Command("docker", "info").CombinedOutput()
-	if err != nil {
-		fatalf("docker is not running:\n%s", strings.TrimSpace(string(out)))
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		fatalf("docker daemon is not running — start Docker Desktop and try again")
 	}
 }
 
