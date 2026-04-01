@@ -13,7 +13,11 @@ func cmdBootstrap(args []string) {
 		fmt.Fprintln(os.Stderr, `drydock bootstrap — interactive setup for test infrastructure
 
 Walks you through creating the cloud accounts, repos, and permissions
-that Drydock needs to test CI/CD workflows end-to-end.
+that Drydock needs to test CI/CD workflows end-to-end via the
+github-actions backend.
+
+Note: for local-only testing, use the compose backend instead — it
+requires only Docker and does not need any cloud infrastructure.
 
 Supported providers: gcp, aws, all`)
 		return
@@ -47,11 +51,17 @@ Supported providers: gcp, aws, all`)
 	}
 
 	// ── Common inputs ───────────────────────────────────────────────────
-	githubOrg := prompt("GitHub organization", "stormbane-security")
+	githubOrg := prompt("GitHub owner (org or username)", "")
 	testRepo := prompt("Test repository name", "ci-testbed")
 	bosunRepo := prompt("Bosun repo (reusable workflows)", githubOrg+"/bosun")
 	region := prompt("Primary region", "us-central1")
 
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "⚠  Cost warning: the generated script creates resources that may incur charges:")
+	fmt.Fprintln(os.Stderr, "   GCP: Artifact Registry storage (~$0.10/GB/month), Cloud Storage bucket")
+	fmt.Fprintln(os.Stderr, "   AWS: ECR storage (~$0.10/GB/month)")
+	fmt.Fprintln(os.Stderr, "   GitHub: Actions minutes (free for public repos)")
+	fmt.Fprintln(os.Stderr, "   WIF, IAM, OIDC providers, and service accounts are free.")
 	fmt.Fprintln(os.Stderr, "")
 
 	var commands []string

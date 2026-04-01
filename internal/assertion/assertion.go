@@ -41,6 +41,8 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkFile(a, baseDir)
 		case "beacon":
 			result = checkBeacon(ctx, a, baseDir, env)
+		case "classify":
+			result = checkClassify(ctx, a, baseDir, env)
 		case "github-run":
 			result = checkGitHubRun(a, outputs)
 		case "github-job":
@@ -280,7 +282,11 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan and capture JSON output.
-	cmd := fmt.Sprintf("beacon scan %s --format json --skip-enrichment 2>/dev/null", a.Target)
+	extraArgs := ""
+	if len(a.Args) > 0 {
+		extraArgs = " " + strings.Join(a.Args, " ")
+	}
+	cmd := fmt.Sprintf("beacon scan %s --format json --skip-enrichment%s 2>/dev/null", a.Target, extraArgs)
 	r := runner.Run(ctx, "beacon-scan", cmd, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
@@ -369,6 +375,227 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		detail += fmt.Sprintf(", %s absent", a.Expect.NotCheckID)
 	}
 	result.Message = detail
+	return result
+}
+
+// ── Classify assertion ────────────────────────────────────────────────────
+
+// classifyOutput matches the JSON output structure of beacon classify --format json.
+type classifyOutput struct {
+	ProxyType        string            `json:"proxy_type"`
+	Framework        string            `json:"framework"`
+	CloudProvider    string            `json:"cloud_provider"`
+	AuthSystem       string            `json:"auth_system"`
+	InfraLayer       string            `json:"infra_layer"`
+	IsKubernetes     bool              `json:"is_kubernetes"`
+	IsServerless     bool              `json:"is_serverless"`
+	IsReverseProxy   bool              `json:"is_reverse_proxy"`
+	HasDMARC         bool              `json:"has_dmarc"`
+	BackendServices  []string          `json:"backend_services"`
+	ServiceVersions  map[string]string `json:"service_versions"`
+	CookieNames      []string          `json:"cookie_names"`
+	RespondingPaths  []string          `json:"responding_paths"`
+	MatchedPlaybooks []string          `json:"matched_playbooks"`
+	StatusCode       int               `json:"status_code"`
+	Title            string            `json:"title"`
+}
+
+func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+
+	if a.Target == "" {
+		result.Message = "target is required for classify assertions"
+		return result
+	}
+
+	// Run beacon classify and capture JSON output.
+	cmd := fmt.Sprintf("beacon classify %s --format json 2>/dev/null", a.Target)
+	r := runner.Run(ctx, "beacon-classify", cmd, baseDir, env)
+	if r.ExitCode != 0 && r.Stdout == "" {
+		result.Message = fmt.Sprintf("beacon classify failed (exit %d): %s", r.ExitCode, r.Stderr)
+		return result
+	}
+
+	var out classifyOutput
+	if err := json.Unmarshal([]byte(r.Stdout), &out); err != nil {
+		result.Message = fmt.Sprintf("failed to parse beacon classify output: %v\nraw output: %.500s", err, r.Stdout)
+		return result
+	}
+
+	// Each expect field is checked independently; all must pass.
+	type check struct {
+		field   string
+		ok      bool
+		message string
+	}
+	var checks []check
+
+	if a.Expect.ProxyType != "" {
+		checks = append(checks, check{
+			field:   "proxy_type",
+			ok:      out.ProxyType == a.Expect.ProxyType,
+			message: fmt.Sprintf("proxy_type: expected %q, got %q", a.Expect.ProxyType, out.ProxyType),
+		})
+	}
+	if a.Expect.FrameworkField != "" {
+		checks = append(checks, check{
+			field:   "framework",
+			ok:      out.Framework == a.Expect.FrameworkField,
+			message: fmt.Sprintf("framework: expected %q, got %q", a.Expect.FrameworkField, out.Framework),
+		})
+	}
+	if a.Expect.CloudProviderField != "" {
+		checks = append(checks, check{
+			field:   "cloud_provider",
+			ok:      out.CloudProvider == a.Expect.CloudProviderField,
+			message: fmt.Sprintf("cloud_provider: expected %q, got %q", a.Expect.CloudProviderField, out.CloudProvider),
+		})
+	}
+	if a.Expect.AuthSystemField != "" {
+		checks = append(checks, check{
+			field:   "auth_system",
+			ok:      out.AuthSystem == a.Expect.AuthSystemField,
+			message: fmt.Sprintf("auth_system: expected %q, got %q", a.Expect.AuthSystemField, out.AuthSystem),
+		})
+	}
+	if a.Expect.InfraLayerField != "" {
+		checks = append(checks, check{
+			field:   "infra_layer",
+			ok:      out.InfraLayer == a.Expect.InfraLayerField,
+			message: fmt.Sprintf("infra_layer: expected %q, got %q", a.Expect.InfraLayerField, out.InfraLayer),
+		})
+	}
+	if a.Expect.IsKubernetes != nil {
+		checks = append(checks, check{
+			field:   "is_kubernetes",
+			ok:      out.IsKubernetes == *a.Expect.IsKubernetes,
+			message: fmt.Sprintf("is_kubernetes: expected %v, got %v", *a.Expect.IsKubernetes, out.IsKubernetes),
+		})
+	}
+	if a.Expect.IsServerless != nil {
+		checks = append(checks, check{
+			field:   "is_serverless",
+			ok:      out.IsServerless == *a.Expect.IsServerless,
+			message: fmt.Sprintf("is_serverless: expected %v, got %v", *a.Expect.IsServerless, out.IsServerless),
+		})
+	}
+	if a.Expect.IsReverseProxy != nil {
+		checks = append(checks, check{
+			field:   "is_reverse_proxy",
+			ok:      out.IsReverseProxy == *a.Expect.IsReverseProxy,
+			message: fmt.Sprintf("is_reverse_proxy: expected %v, got %v", *a.Expect.IsReverseProxy, out.IsReverseProxy),
+		})
+	}
+	if a.Expect.HasDMARC != nil {
+		checks = append(checks, check{
+			field:   "has_dmarc",
+			ok:      out.HasDMARC == *a.Expect.HasDMARC,
+			message: fmt.Sprintf("has_dmarc: expected %v, got %v", *a.Expect.HasDMARC, out.HasDMARC),
+		})
+	}
+	if a.Expect.BackendService != "" {
+		found := false
+		for _, svc := range out.BackendServices {
+			if svc == a.Expect.BackendService {
+				found = true
+				break
+			}
+		}
+		checks = append(checks, check{
+			field:   "backend_service",
+			ok:      found,
+			message: fmt.Sprintf("backend_service: %q not found in %v", a.Expect.BackendService, out.BackendServices),
+		})
+	}
+	if a.Expect.ServiceVersion != "" {
+		_, exists := out.ServiceVersions[a.Expect.ServiceVersion]
+		checks = append(checks, check{
+			field:   "service_version",
+			ok:      exists,
+			message: fmt.Sprintf("service_version: key %q not found in service_versions", a.Expect.ServiceVersion),
+		})
+	}
+	if a.Expect.CookieName != "" {
+		found := false
+		for _, c := range out.CookieNames {
+			if c == a.Expect.CookieName {
+				found = true
+				break
+			}
+		}
+		checks = append(checks, check{
+			field:   "cookie_name",
+			ok:      found,
+			message: fmt.Sprintf("cookie_name: %q not found in %v", a.Expect.CookieName, out.CookieNames),
+		})
+	}
+	if a.Expect.PathResponds != "" {
+		found := false
+		for _, p := range out.RespondingPaths {
+			if p == a.Expect.PathResponds {
+				found = true
+				break
+			}
+		}
+		checks = append(checks, check{
+			field:   "path_responds",
+			ok:      found,
+			message: fmt.Sprintf("path_responds: %q not found in %v", a.Expect.PathResponds, out.RespondingPaths),
+		})
+	}
+	if a.Expect.MatchedPlaybook != "" {
+		found := false
+		for _, pb := range out.MatchedPlaybooks {
+			if pb == a.Expect.MatchedPlaybook {
+				found = true
+				break
+			}
+		}
+		checks = append(checks, check{
+			field:   "matched_playbook",
+			ok:      found,
+			message: fmt.Sprintf("matched_playbook: %q not found in %v", a.Expect.MatchedPlaybook, out.MatchedPlaybooks),
+		})
+	}
+	if a.Expect.StatusCodeField != nil {
+		checks = append(checks, check{
+			field:   "status_code",
+			ok:      out.StatusCode == *a.Expect.StatusCodeField,
+			message: fmt.Sprintf("status_code: expected %d, got %d", *a.Expect.StatusCodeField, out.StatusCode),
+		})
+	}
+	if a.Expect.TitleContains != "" {
+		checks = append(checks, check{
+			field:   "title_contains",
+			ok:      strings.Contains(out.Title, a.Expect.TitleContains),
+			message: fmt.Sprintf("title_contains: %q not found in title %q", a.Expect.TitleContains, out.Title),
+		})
+	}
+	if a.Expect.NotProxyType != "" {
+		checks = append(checks, check{
+			field:   "not_proxy_type",
+			ok:      out.ProxyType != a.Expect.NotProxyType,
+			message: fmt.Sprintf("not_proxy_type: proxy_type must not be %q but is", a.Expect.NotProxyType),
+		})
+	}
+	if a.Expect.NotFramework != "" {
+		checks = append(checks, check{
+			field:   "not_framework",
+			ok:      out.Framework != a.Expect.NotFramework,
+			message: fmt.Sprintf("not_framework: framework must not be %q but is", a.Expect.NotFramework),
+		})
+	}
+
+	// All checks must pass.
+	for _, c := range checks {
+		if !c.ok {
+			result.Message = c.message
+			return result
+		}
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("classify check passed (%d fields verified)", len(checks))
 	return result
 }
 
