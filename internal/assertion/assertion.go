@@ -376,6 +376,9 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Run beacon scan with proper argument separation (no shell injection).
 	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich", "--no-tui"}
 	argv = append(argv, a.Args...)
+	// Suppress beacon's informational stderr (missing API keys, nmap warnings,
+	// progress lines) — drydock only cares about findings JSON on stdout.
+	env["BEACON_QUIET"] = "1"
 	// Auto-acknowledge --authorized prompts in CI/drydock — the operator
 	// controls which scenarios run; the interactive prompt is for ad-hoc CLI use.
 	for _, arg := range a.Args {
