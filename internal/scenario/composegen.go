@@ -13,6 +13,7 @@ import (
 // composeFile is the top-level Docker Compose v3 structure.
 type composeFile struct {
 	Services map[string]composeServiceOut `yaml:"services"`
+	Networks map[string]ComposeNetwork    `yaml:"networks,omitempty"`
 }
 
 // composeServiceOut is the output representation of a service for the generated
@@ -28,10 +29,10 @@ type composeServiceOut struct {
 	Command     any               `yaml:"command,omitempty"`
 	Entrypoint  any               `yaml:"entrypoint,omitempty"`
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
-	CapAdd      []string          `yaml:"cap_add,omitempty"`
-	SecurityOpt []string         `yaml:"security_opt,omitempty"`
-	Networks    []string          `yaml:"networks,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"`
+	CapAdd      []string                          `yaml:"cap_add,omitempty"`
+	SecurityOpt []string                         `yaml:"security_opt,omitempty"`
+	Networks    map[string]ComposeServiceNetwork  `yaml:"networks,omitempty"`
+	Restart     string                            `yaml:"restart,omitempty"`
 }
 
 // PortMapping records the intended host port for a container port on a service.
@@ -65,7 +66,7 @@ func parsePortSpec(spec string) (host, container string) {
 // port plan. All host ports are rewritten to ephemeral (0) to avoid conflicts.
 // Volume paths starting with "./" are resolved to absolute paths relative to baseDir.
 // The caller is responsible for removing the temp directory when done.
-func GenerateComposeFile(services map[string]ComposeService, baseDir string) (string, *PortPlan, error) {
+func GenerateComposeFile(services map[string]ComposeService, baseDir string, networks map[string]ComposeNetwork) (string, *PortPlan, error) {
 	if len(services) == 0 {
 		return "", nil, fmt.Errorf("no services defined")
 	}
@@ -73,6 +74,7 @@ func GenerateComposeFile(services map[string]ComposeService, baseDir string) (st
 	plan := &PortPlan{}
 	out := composeFile{
 		Services: make(map[string]composeServiceOut, len(services)),
+		Networks: networks,
 	}
 
 	for name, svc := range services {

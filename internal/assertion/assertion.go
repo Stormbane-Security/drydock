@@ -321,7 +321,14 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Run beacon scan with proper argument separation (no shell injection).
 	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
-	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
+	// Set BEACON_AUTHORIZED_ACK=1 to skip interactive confirmation in authorized mode.
+	// Drydock tests run against sandboxed infrastructure we own.
+	beaconEnv := make(map[string]string)
+	for k, v := range env {
+		beaconEnv[k] = v
+	}
+	beaconEnv["BEACON_AUTHORIZED_ACK"] = "1"
+	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, beaconEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result

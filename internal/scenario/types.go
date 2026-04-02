@@ -60,6 +60,9 @@ type Scenario struct {
 	// Artifacts configures what to collect after the run.
 	Artifacts ArtifactConfig `yaml:"artifacts,omitempty"`
 
+	// Networks defines top-level Docker Compose networks with IPAM config.
+	Networks map[string]ComposeNetwork `yaml:"networks,omitempty"`
+
 	// Env injects environment variables into all commands and backends.
 	Env map[string]string `yaml:"env,omitempty"`
 
@@ -90,8 +93,28 @@ type ComposeService struct {
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	SecurityOpt []string         `yaml:"security_opt,omitempty"`
-	Networks    []string          `yaml:"networks,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"`
+	Networks    map[string]ComposeServiceNetwork `yaml:"networks,omitempty"`
+	Restart     string                           `yaml:"restart,omitempty"`
+}
+
+// ComposeServiceNetwork is the per-service network config (optional static IP).
+type ComposeServiceNetwork struct {
+	IPv4Address string `yaml:"ipv4_address,omitempty"`
+}
+
+// ComposeNetwork defines a top-level Docker Compose network.
+type ComposeNetwork struct {
+	IPAM *ComposeIPAM `yaml:"ipam,omitempty"`
+}
+
+// ComposeIPAM configures IP address management for a network.
+type ComposeIPAM struct {
+	Config []ComposeIPAMConfig `yaml:"config,omitempty"`
+}
+
+// ComposeIPAMConfig is a single IPAM subnet configuration.
+type ComposeIPAMConfig struct {
+	Subnet string `yaml:"subnet,omitempty"`
 }
 
 // ComposeBuild mirrors the Docker Compose build configuration.
