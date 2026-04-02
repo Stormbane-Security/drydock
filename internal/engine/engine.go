@@ -220,6 +220,15 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 	}
 	record.Outputs = allOutputs
 
+	// Inject the compose network name so scanner assertions can run in-network.
+	// The compose default network is always "<project>_default".
+	if s.IsUnifiedFormat() || s.Backend.Type == "compose" || s.Backend.Type == "hybrid" {
+		if s.Env == nil {
+			s.Env = make(map[string]string)
+		}
+		s.Env["DRYDOCK_NETWORK"] = "drydock-" + s.Name + "_default"
+	}
+
 	// Phase 6: Run assertions.
 	if len(s.Assertions) > 0 {
 		e.log("running %d assertions...", len(s.Assertions))

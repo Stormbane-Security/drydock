@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/stormbane-security/drydock/internal/artifact"
@@ -25,6 +26,16 @@ func scannerBin() string {
 		return bin
 	}
 	return "beacon"
+}
+
+// scannerBinLinux returns the scanner binary to mount into Linux containers.
+// Falls back to DRYDOCK_SCANNER_BIN → "beacon". On macOS, users must set
+// DRYDOCK_SCANNER_BIN_LINUX to a cross-compiled Linux binary.
+func scannerBinLinux() string {
+	if bin := os.Getenv("DRYDOCK_SCANNER_BIN_LINUX"); bin != "" {
+		return bin
+	}
+	return scannerBin()
 }
 
 // ── Finding types ─────────────────────────────────────────────────────────
@@ -134,10 +145,6 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 
 	bin := scannerBin()
 
-	// Run scanner with proper argument separation (no shell injection).
-	argv := []string{bin, "scan", "--domain", a.Target, "--format", "json", "--no-enrich", "--no-tui"}
-	argv = append(argv, a.Args...)
-
 	// Suppress informational stderr in automated runs.
 	env["BEACON_QUIET"] = "1"
 
@@ -149,7 +156,24 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 			break
 		}
 	}
-	r := runner.RunExec(ctx, bin+"-scan", argv, baseDir, env)
+
+	// Build the scanner command arguments (everything after the binary name).
+	scanArgs := []string{"scan", "--domain", a.Target, "--format", "json", "--no-enrich", "--no-tui"}
+	scanArgs = append(scanArgs, a.Args...)
+
+	var r runner.Result
+
+	if network := env["DRYDOCK_NETWORK"]; network != "" {
+		// Run beacon inside a container on the scenario's Docker network.
+		// This isolates the scan to only see test infrastructure, not the host.
+		// Use the Linux binary since containers are always Linux.
+		r = runScannerInNetwork(ctx, scannerBinLinux(), network, scanArgs, baseDir, env)
+	} else {
+		// No network isolation — run directly on the host.
+		argv := append([]string{bin}, scanArgs...)
+		r = runner.RunExec(ctx, bin+"-scan", argv, baseDir, env)
+	}
+
 	// Surface scanner stderr so debug lines are visible in test output.
 	if r.Stderr != "" {
 		fmt.Fprintf(os.Stderr, "drydock: %s stderr: %s\n", bin, r.Stderr)
@@ -254,6 +278,84 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 	result.Message = detail
 	return result
+}
+
+// runScannerInNetwork runs the scanner binary inside a Docker container
+// attached to the scenario's compose network. This ensures the scan only
+// sees test infrastructure, not host services.
+//
+// Image resolution order:
+//  1. DRYDOCK_SCANNER_IMAGE env var (custom image, scanner must be pre-installed)
+//  2. "beacon-scanner" default image (built from deploy/Dockerfile)
+//
+// If DRYDOCK_SCANNER_BIN_LINUX is set, the binary is volume-mounted into the
+// container instead of using the image's built-in scanner. This is useful for
+// local development where you want to test a freshly compiled binary.
+func runScannerInNetwork(ctx context.Context, bin, network string, scanArgs []string, baseDir string, env map[string]string) runner.Result {
+	image := "beacon-scanner"
+	if img := os.Getenv("DRYDOCK_SCANNER_IMAGE"); img != "" {
+		image = img
+	}
+
+	// Mount a local binary if DRYDOCK_SCANNER_BIN_LINUX is explicitly set.
+	mountBinary := os.Getenv("DRYDOCK_SCANNER_BIN_LINUX") != ""
+
+	argv := []string{
+		"docker", "run", "--rm",
+		"--network", network,
+	}
+
+	if mountBinary {
+		binAbs, err := filepath.Abs(bin)
+		if err != nil {
+			return runner.Result{
+				Name:     "scanner-network",
+				ExitCode: -1,
+				Error:    fmt.Sprintf("cannot resolve scanner binary path: %v", err),
+			}
+		}
+		if _, err := os.Stat(binAbs); err != nil {
+			return runner.Result{
+				Name:     "scanner-network",
+				ExitCode: -1,
+				Error:    fmt.Sprintf("scanner binary not found at %s: %v", binAbs, err),
+			}
+		}
+		argv = append(argv, "-v", binAbs+":/usr/local/bin/scanner:ro")
+	}
+
+	// Forward environment variables the scanner needs.
+	forwardVars := []string{
+		"BEACON_QUIET",
+		"BEACON_AUTHORIZED_ACK",
+		"BEACON_STORE_PATH",
+		"SHODAN_API_KEY",
+		"CENSYS_API_ID",
+		"CENSYS_API_SECRET",
+		"WHOISXML_API_KEY",
+		"VT_API_KEY",
+	}
+	for _, k := range forwardVars {
+		if v, ok := env[k]; ok && v != "" {
+			if k == "BEACON_STORE_PATH" {
+				argv = append(argv, "-e", k+"=/tmp/beacon.db")
+				continue
+			}
+			argv = append(argv, "-e", k+"="+v)
+		}
+	}
+
+	if mountBinary {
+		// Override the image entrypoint to use the mounted binary.
+		argv = append(argv, "--entrypoint", "scanner")
+	}
+
+	// Image name, then scan args. The default image has ENTRYPOINT ["beacon"]
+	// so args are passed directly. With mountBinary, entrypoint is overridden.
+	argv = append(argv, image)
+	argv = append(argv, scanArgs...)
+
+	return runner.RunExec(ctx, "scanner-network", argv, baseDir, env)
 }
 
 // ── Classify assertion ────────────────────────────────────────────────────
