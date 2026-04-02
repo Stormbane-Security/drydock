@@ -274,12 +274,39 @@ func checkFile(a scenario.Assertion, baseDir string) artifact.AssertionResult {
 // ── Beacon assertion ─────────────────────────────────────────────────────
 
 // beaconFinding matches the JSON output structure of beacon scan --format json.
+// Beacon wraps findings as {"finding": {check_id, ...}, "explanation": ...}.
+// Severity is int in beacon (not string), so we use json.RawMessage.
 type beaconFinding struct {
-	CheckID  string         `json:"check_id"`
-	Severity string         `json:"severity"`
-	Title    string         `json:"title"`
-	Asset    string         `json:"asset"`
-	Evidence map[string]any `json:"evidence"`
+	CheckID  string          `json:"check_id"`
+	Severity json.RawMessage `json:"severity"`
+	Title    string          `json:"title"`
+	Asset    string          `json:"asset"`
+	Evidence map[string]any  `json:"evidence"`
+}
+
+// severityString returns the severity as a comparable string.
+func (f beaconFinding) severityString() string {
+	s := strings.Trim(string(f.Severity), `"`)
+	// Map numeric severity values to names.
+	switch s {
+	case "0":
+		return "info"
+	case "1":
+		return "low"
+	case "2":
+		return "medium"
+	case "3":
+		return "high"
+	case "4":
+		return "critical"
+	default:
+		return s
+	}
+}
+
+// beaconEnrichedFinding matches the enriched wrapper that beacon emits.
+type beaconEnrichedFinding struct {
+	Finding beaconFinding `json:"finding"`
 }
 
 func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
@@ -292,7 +319,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan with proper argument separation (no shell injection).
-	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--skip-enrichment"}
+	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
@@ -301,17 +328,28 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Parse findings from JSON output.
+	// Beacon outputs: {"findings": [{"finding": {"check_id": ...}, "explanation": ...}]}
 	var findings []beaconFinding
 	if err := json.Unmarshal([]byte(r.Stdout), &findings); err != nil {
-		// Try parsing as a wrapper object with a "findings" key.
-		var wrapper struct {
-			Findings []beaconFinding `json:"findings"`
+		// Try enriched wrapper: {"findings": [{"finding": {...}}]}
+		var enrichedWrapper struct {
+			Findings []beaconEnrichedFinding `json:"findings"`
 		}
-		if err2 := json.Unmarshal([]byte(r.Stdout), &wrapper); err2 != nil {
-			result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
-			return result
+		if err2 := json.Unmarshal([]byte(r.Stdout), &enrichedWrapper); err2 == nil && len(enrichedWrapper.Findings) > 0 {
+			for _, ef := range enrichedWrapper.Findings {
+				findings = append(findings, ef.Finding)
+			}
+		} else {
+			// Try flat wrapper: {"findings": [{"check_id": ...}]}
+			var flatWrapper struct {
+				Findings []beaconFinding `json:"findings"`
+			}
+			if err3 := json.Unmarshal([]byte(r.Stdout), &flatWrapper); err3 != nil {
+				result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
+				return result
+			}
+			findings = flatWrapper.Findings
 		}
-		findings = wrapper.Findings
 	}
 
 	// Check min/max finding counts.
@@ -331,8 +369,8 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 			if f.CheckID == a.Expect.CheckID {
 				found = true
 				// If severity is also specified, verify it matches.
-				if a.Expect.Severity != "" && f.Severity != a.Expect.Severity {
-					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.Severity, a.Expect.Severity)
+				if a.Expect.Severity != "" && f.severityString() != a.Expect.Severity {
+					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.severityString(), a.Expect.Severity)
 					return result
 				}
 				// If evidence key/value is specified, verify it.

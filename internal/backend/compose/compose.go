@@ -18,6 +18,8 @@ type Backend struct {
 	projectName string
 	dir         string
 	env         []string
+	portPlan    []PortMapping     // stored by SetPortPlan
+	portSubs    map[string]string // intendedHostPort → actualHostPort
 }
 
 // New creates a Compose backend.
@@ -159,4 +161,48 @@ func (b *Backend) Destroy(ctx context.Context) error {
 		return fmt.Errorf("compose down: %s: %w", stderr, err)
 	}
 	return nil
+}
+
+// PortMapping holds the intended and container port for a service.
+type PortMapping struct {
+	Service       string
+	IntendedHost  string
+	ContainerPort string
+}
+
+// SetPortPlan stores the port mappings for later querying after Create.
+func (b *Backend) SetPortPlan(mappings []PortMapping) {
+	b.portPlan = mappings
+}
+
+// GetPortPlan returns the stored port plan.
+func (b *Backend) GetPortPlan() []PortMapping {
+	return b.portPlan
+}
+
+// QueryPorts discovers actual ephemeral ports assigned by Docker for each
+// port mapping and builds a substitution map (intendedHost → actualHost).
+func (b *Backend) QueryPorts(ctx context.Context, mappings []PortMapping) error {
+	b.portSubs = make(map[string]string)
+	for _, m := range mappings {
+		stdout, _, err := b.run(ctx, "port", m.Service, m.ContainerPort)
+		if err != nil {
+			return fmt.Errorf("querying port %s/%s: %w", m.Service, m.ContainerPort, err)
+		}
+		// Output is like "0.0.0.0:56789\n" — extract just the port.
+		addr := strings.TrimSpace(stdout)
+		if idx := strings.LastIndex(addr, ":"); idx >= 0 {
+			actualPort := addr[idx+1:]
+			b.portSubs[m.IntendedHost] = actualPort
+		}
+	}
+	return nil
+}
+
+// PortSubs returns the port substitution map (intendedHost → actualHost).
+func (b *Backend) PortSubs() map[string]string {
+	if b.portSubs == nil {
+		return map[string]string{}
+	}
+	return b.portSubs
 }

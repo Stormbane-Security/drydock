@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,23 +34,63 @@ type composeServiceOut struct {
 	Restart     string            `yaml:"restart,omitempty"`
 }
 
+// PortMapping records the intended host port for a container port on a service.
+type PortMapping struct {
+	Service       string
+	IntendedHost  string // Original host port from YAML (e.g. "2379")
+	ContainerPort string // Container port (e.g. "2379")
+}
+
+// PortPlan holds all port mappings from the original YAML before ephemeral
+// port rewriting. After compose up, these are used to query actual ports
+// and substitute throughout ready checks, commands, and assertions.
+type PortPlan struct {
+	Mappings []PortMapping
+}
+
+// parsePortSpec splits a Docker Compose port string like "8080:80" or "8080"
+// into (hostPort, containerPort). If only one part, both are the same.
+func parsePortSpec(spec string) (host, container string) {
+	// Handle quoted specs
+	spec = strings.Trim(spec, `"'`)
+	parts := strings.SplitN(spec, ":", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return parts[0], parts[0]
+}
+
 // GenerateComposeFile marshals the services map into a valid Docker Compose v3
-// YAML file, writes it to a temp directory, and returns the file path.
+// YAML file, writes it to a temp directory, and returns the file path and
+// port plan. All host ports are rewritten to ephemeral (0) to avoid conflicts.
 // The caller is responsible for removing the temp directory when done.
-func GenerateComposeFile(services map[string]ComposeService) (string, error) {
+func GenerateComposeFile(services map[string]ComposeService) (string, *PortPlan, error) {
 	if len(services) == 0 {
-		return "", fmt.Errorf("no services defined")
+		return "", nil, fmt.Errorf("no services defined")
 	}
 
+	plan := &PortPlan{}
 	out := composeFile{
 		Services: make(map[string]composeServiceOut, len(services)),
 	}
 
 	for name, svc := range services {
+		// Rewrite ports to use ephemeral host ports.
+		ephemeralPorts := make([]string, len(svc.Ports))
+		for i, p := range svc.Ports {
+			host, container := parsePortSpec(p)
+			plan.Mappings = append(plan.Mappings, PortMapping{
+				Service:       name,
+				IntendedHost:  host,
+				ContainerPort: container,
+			})
+			ephemeralPorts[i] = "0:" + container
+		}
+
 		out.Services[name] = composeServiceOut{
 			Image:       svc.Image,
 			Build:       svc.Build,
-			Ports:       svc.Ports,
+			Ports:       ephemeralPorts,
 			Environment: svc.Environment,
 			Volumes:     svc.Volumes,
 			DependsOn:   svc.DependsOn,
@@ -65,21 +106,21 @@ func GenerateComposeFile(services map[string]ComposeService) (string, error) {
 
 	data, err := yaml.Marshal(&out)
 	if err != nil {
-		return "", fmt.Errorf("marshaling compose file: %w", err)
+		return "", nil, fmt.Errorf("marshaling compose file: %w", err)
 	}
 
 	dir, err := os.MkdirTemp("", "drydock-compose-*")
 	if err != nil {
-		return "", fmt.Errorf("creating temp dir: %w", err)
+		return "", nil, fmt.Errorf("creating temp dir: %w", err)
 	}
 
 	path := filepath.Join(dir, "compose.yaml")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("writing compose file: %w", err)
+		return "", nil, fmt.Errorf("writing compose file: %w", err)
 	}
 
-	return path, nil
+	return path, plan, nil
 }
 
 // GenerateComposeBytes marshals the services map into Docker Compose v3 YAML bytes.
