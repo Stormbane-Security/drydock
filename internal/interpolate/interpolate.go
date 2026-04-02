@@ -76,7 +76,12 @@ func resolve(s string, outputs map[string]string) (string, error) {
 	}
 	var missing []string
 	result := pattern.ReplaceAllStringFunc(s, func(match string) string {
-		key := pattern.FindStringSubmatch(match)[1]
+		subs := pattern.FindStringSubmatch(match)
+		if len(subs) < 2 {
+			missing = append(missing, match)
+			return match
+		}
+		key := subs[1]
 		val, ok := outputs[key]
 		if !ok {
 			missing = append(missing, key)

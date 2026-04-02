@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/stormbane-security/drydock/internal/artifact"
@@ -119,6 +120,10 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 				e.log("warning: destroy %s failed: %v", b.Name(), err)
 			}
 		}
+		// Clean up generated temp compose dir for unified format.
+		if s.IsUnifiedFormat() {
+			e.cleanupGeneratedCompose(backends)
+		}
 	}()
 
 	// Phase 1: Create environment.
@@ -141,6 +146,34 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 			record.Error = fmt.Sprintf("%s not ready: %v", b.Name(), err)
 			e.finalize(record)
 			return record, fmt.Errorf("%s wait: %w", b.Name(), err)
+		}
+	}
+
+	// Phase 2b: Run ready check (unified format).
+	if s.Ready != nil {
+		e.log("running ready check (timeout %s, interval %s)...", s.Ready.Timeout.Duration, s.Ready.Interval.Duration)
+		if err := e.runReadyCheck(ctx, s); err != nil {
+			record.Status = "error"
+			record.Error = fmt.Sprintf("ready check failed: %v", err)
+			e.finalize(record)
+			return record, fmt.Errorf("ready check: %w", err)
+		}
+		e.log("ready check passed")
+	}
+
+	// Phase 2c: Run pre-assertion commands (unified format "run" field).
+	if len(s.Run) > 0 {
+		e.log("running %d commands...", len(s.Run))
+		for i, cmd := range s.Run {
+			name := fmt.Sprintf("run[%d]", i)
+			r := runner.Run(ctx, name, cmd, s.Dir, s.Env)
+			record.CommandResults = append(record.CommandResults, r)
+			if r.ExitCode != 0 || r.Error != "" {
+				record.Status = "error"
+				record.Error = fmt.Sprintf("run command %d failed (exit %d): %s", i, r.ExitCode, r.Error)
+				e.finalize(record)
+				return record, fmt.Errorf("run command %d: exit %d", i, r.ExitCode)
+			}
 		}
 	}
 
@@ -285,6 +318,20 @@ func (e *Engine) ListRuns() ([]string, error) {
 }
 
 func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error) {
+	// Unified format: generate compose.yaml from inline services.
+	if s.IsUnifiedFormat() {
+		composeFile, err := scenario.GenerateComposeFile(s.Services)
+		if err != nil {
+			return nil, fmt.Errorf("generating compose file: %w", err)
+		}
+		dir := filepath.Dir(composeFile)
+		file := filepath.Base(composeFile)
+		return []backend.Backend{
+			compose.New(dir, file, "drydock-"+s.Name, s.Env),
+		}, nil
+	}
+
+	// Old format: use backend configuration.
 	var backends []backend.Backend
 
 	autoApprove := true
@@ -331,6 +378,130 @@ func (e *Engine) createFixture(s *scenario.Scenario) *tf.Backend {
 		workspace = "drydock-fixture-" + s.Name
 	}
 	return tf.New(s.Dir, s.Fixture.Module, s.Fixture.Vars, workspace, true, s.Env)
+}
+
+// cleanupGeneratedCompose removes the temporary directory created for generated
+// compose files in unified format scenarios.
+func (e *Engine) cleanupGeneratedCompose(backends []backend.Backend) {
+	for _, b := range backends {
+		if cb, ok := b.(*compose.Backend); ok {
+			dir := cb.Dir()
+			if dir != "" {
+				if err := os.RemoveAll(dir); err != nil {
+					e.log("warning: removing temp compose dir: %v", err)
+				}
+			}
+		}
+	}
+}
+
+// runReadyCheck executes the scenario's ready probe in a loop until it
+// succeeds or the timeout elapses.
+func (e *Engine) runReadyCheck(ctx context.Context, s *scenario.Scenario) error {
+	if s.Ready == nil {
+		return nil
+	}
+
+	deadline := time.After(s.Ready.Timeout.Duration)
+	tick := time.NewTicker(s.Ready.Interval.Duration)
+	defer tick.Stop()
+
+	var lastErr string
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for ready check: %s", lastErr)
+		case <-deadline:
+			return fmt.Errorf("timed out after %s waiting for ready check: %s", s.Ready.Timeout.Duration, lastErr)
+		case <-tick.C:
+			r := runner.Run(ctx, "ready-check", s.Ready.Cmd, s.Dir, s.Env)
+			if r.ExitCode == 0 && r.Error == "" {
+				return nil
+			}
+			lastErr = fmt.Sprintf("exit=%d stderr=%s", r.ExitCode, r.Stderr)
+		}
+	}
+}
+
+// SetupDebug brings up the infrastructure for a scenario without running tests.
+// It returns the backends and a cleanup function. The caller must call cleanup
+// when done (typically on interrupt signal).
+func (e *Engine) SetupDebug(ctx context.Context, s *scenario.Scenario) ([]backend.Backend, func(), error) {
+	backends, err := e.createBackends(s)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cleanup := func() {
+		e.log("tearing down environment...")
+		destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer destroyCancel()
+		for _, b := range backends {
+			if err := b.Destroy(destroyCtx); err != nil {
+				e.log("warning: destroy %s failed: %v", b.Name(), err)
+			}
+		}
+		// Clean up generated compose file for unified format.
+		if s.IsUnifiedFormat() {
+			// The compose file is in a temp dir managed by the backend's dir field.
+			// compose.Destroy already runs docker compose down.
+		}
+	}
+
+	// Bring up all backends.
+	e.log("creating environment (%d backends)...", len(backends))
+	for _, b := range backends {
+		e.log("  starting %s...", b.Name())
+		if err := b.Create(ctx); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("%s create: %w", b.Name(), err)
+		}
+	}
+
+	// Wait for backend readiness.
+	e.log("waiting for environment readiness...")
+	for _, b := range backends {
+		if err := b.WaitReady(ctx); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("%s wait: %w", b.Name(), err)
+		}
+	}
+
+	// Run ready check if defined.
+	if s.Ready != nil {
+		e.log("running ready check...")
+		if err := e.runReadyCheck(ctx, s); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("ready check: %w", err)
+		}
+	}
+
+	return backends, cleanup, nil
+}
+
+// ServiceEndpoints returns a human-readable list of service endpoints
+// extracted from the scenario's service port mappings.
+func ServiceEndpoints(s *scenario.Scenario) []string {
+	var endpoints []string
+	for name, svc := range s.Services {
+		for _, p := range svc.Ports {
+			endpoints = append(endpoints, fmt.Sprintf("%s on localhost:%s", name, hostPort(p)))
+		}
+		if len(svc.Ports) == 0 {
+			endpoints = append(endpoints, name)
+		}
+	}
+	return endpoints
+}
+
+// hostPort extracts the host port from a port mapping like "8080:8080" or "8080".
+func hostPort(mapping string) string {
+	for i, c := range mapping {
+		if c == ':' {
+			return mapping[:i]
+		}
+	}
+	return mapping
 }
 
 func commandsToSpecs(commands []scenario.Command) []runner.CommandSpec {

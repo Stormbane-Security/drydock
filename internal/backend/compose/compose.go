@@ -37,6 +37,9 @@ func New(dir, composeFile, projectName string, env map[string]string) *Backend {
 
 func (b *Backend) Name() string { return "compose" }
 
+// Dir returns the working directory for this compose backend.
+func (b *Backend) Dir() string { return b.dir }
+
 func (b *Backend) run(ctx context.Context, args ...string) (string, string, error) {
 	fullArgs := []string{"-f", filepath.Join(b.dir, b.composeFile)}
 	if b.projectName != "" {

@@ -7,6 +7,7 @@
 //	drydock validate <scenario-path>     Validate scenario YAML
 //	drydock run <scenario-path>          Run a scenario end-to-end
 //	drydock run --tags <tag> <dir>       Run scenarios matching tags
+//	drydock debug <scenario-path>        Start infra and wait for manual testing
 //	drydock destroy <scenario-path>      Force-destroy a scenario's environment
 //	drydock inspect <run-id>             Show results of a previous run
 //	drydock list                         List all previous runs
@@ -19,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -43,6 +45,8 @@ func main() {
 		cmdValidate(args)
 	case "run":
 		cmdRun(args)
+	case "debug":
+		cmdDebug(args)
 	case "destroy":
 		cmdDestroy(args)
 	case "inspect":
@@ -68,6 +72,7 @@ func usage() {
 Usage:
   drydock validate <path>              Validate a scenario file or directory
   drydock run [flags] <path>           Run a scenario or all scenarios in a directory
+  drydock debug <path>                 Start infrastructure and wait for manual testing
   drydock destroy <path>               Tear down a scenario's environment
   drydock inspect <run-id>             Show results of a previous run
   drydock list                         List all previous runs
@@ -100,6 +105,15 @@ func cmdValidate(args []string) {
 	fmt.Fprintf(os.Stderr, "drydock: %d scenario(s) validated\n", len(scenarios))
 }
 
+func requireDocker() {
+	if _, err := exec.LookPath("docker"); err != nil {
+		fatalf("docker not found in PATH — install Docker to run scenarios")
+	}
+	if err := exec.Command("docker", "info").Run(); err != nil {
+		fatalf("docker daemon is not running — start Docker Desktop and try again")
+	}
+}
+
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
@@ -110,6 +124,8 @@ func cmdRun(args []string) {
 	if fs.NArg() == 0 {
 		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")
 	}
+
+	requireDocker()
 
 	scenarios := loadScenarios(fs.Arg(0))
 
@@ -187,6 +203,56 @@ func cmdRun(args []string) {
 	if failed > 0 || errored > 0 {
 		os.Exit(1)
 	}
+}
+
+func cmdDebug(args []string) {
+	if len(args) == 0 {
+		fatalf("usage: drydock debug <scenario-path>")
+	}
+
+	requireDocker()
+
+	s, err := scenario.Load(args[0])
+	if err != nil {
+		fatalf("loading scenario: %v", err)
+	}
+	if err := s.Validate(); err != nil {
+		fatalf("validation failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eng := engine.New(".drydock/runs")
+	_, cleanup, err := eng.SetupDebug(ctx, s)
+	if err != nil {
+		fatalf("setup failed: %v", err)
+	}
+
+	// Print service information.
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Infrastructure is up.")
+	if s.IsUnifiedFormat() {
+		endpoints := engine.ServiceEndpoints(s)
+		fmt.Fprintf(os.Stderr, "Services:\n")
+		for _, ep := range endpoints {
+			fmt.Fprintf(os.Stderr, "  %s\n", ep)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Backend: %s\n", s.Backend.Type)
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Press Ctrl+C to tear down")
+	fmt.Fprintln(os.Stderr)
+
+	// Wait for interrupt.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	fmt.Fprintln(os.Stderr)
+	cleanup()
+	fmt.Fprintln(os.Stderr, "drydock: environment destroyed")
 }
 
 func cmdDestroy(args []string) {

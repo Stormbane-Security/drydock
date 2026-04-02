@@ -2,6 +2,7 @@ package assertion
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -393,5 +394,581 @@ func TestAllPassed(t *testing.T) {
 	results = append(results, artifact.AssertionResult{Name: "c", Passed: false})
 	if AllPassed(results) {
 		t.Error("expected not all passed")
+	}
+}
+
+func TestAllPassed_Empty(t *testing.T) {
+	// Vacuous truth: empty slice means all passed.
+	if !AllPassed(nil) {
+		t.Error("expected all passed for nil slice")
+	}
+	if !AllPassed([]artifact.AssertionResult{}) {
+		t.Error("expected all passed for empty slice")
+	}
+}
+
+func TestAllPassed_SingleFail(t *testing.T) {
+	results := []artifact.AssertionResult{
+		{Name: "x", Passed: false, Message: "nope"},
+	}
+	if AllPassed(results) {
+		t.Error("expected not all passed with single failure")
+	}
+}
+
+// ── checkFile additional tests ────────────────────────────────────────────
+
+func TestCheckFile_ExistsTrue(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "present.txt"), []byte("data"), 0o644)
+
+	exists := true
+	a := scenario.Assertion{
+		Name:   "exists",
+		Type:   "file",
+		Target: "present.txt",
+		Expect: scenario.AssertionExpect{Exists: &exists},
+	}
+	result := checkFile(a, dir)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckFile_ExistsFalse(t *testing.T) {
+	dir := t.TempDir()
+
+	exists := false
+	a := scenario.Assertion{
+		Name:   "not-exists",
+		Type:   "file",
+		Target: "gone.txt",
+		Expect: scenario.AssertionExpect{Exists: &exists},
+	}
+	result := checkFile(a, dir)
+	if !result.Passed {
+		t.Errorf("expected pass (file correctly absent), got: %s", result.Message)
+	}
+}
+
+func TestCheckFile_ExistsFalse_ButFilePresent(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "should-not-be-here.txt"), []byte("x"), 0o644)
+
+	exists := false
+	a := scenario.Assertion{
+		Name:   "should-not-exist",
+		Type:   "file",
+		Target: "should-not-be-here.txt",
+		Expect: scenario.AssertionExpect{Exists: &exists},
+	}
+	result := checkFile(a, dir)
+	if result.Passed {
+		t.Error("expected fail when file exists but should not")
+	}
+}
+
+func TestCheckFile_ContainsMatch(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("database: postgres\nport: 5432"), 0o644)
+
+	a := scenario.Assertion{
+		Name:   "has-postgres",
+		Type:   "file",
+		Target: "config.yaml",
+		Expect: scenario.AssertionExpect{Contains: "postgres"},
+	}
+	result := checkFile(a, dir)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckFile_ContainsNoMatch(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("database: mysql"), 0o644)
+
+	a := scenario.Assertion{
+		Name:   "has-postgres",
+		Type:   "file",
+		Target: "config.yaml",
+		Expect: scenario.AssertionExpect{Contains: "postgres"},
+	}
+	result := checkFile(a, dir)
+	if result.Passed {
+		t.Error("expected fail when file does not contain expected text")
+	}
+}
+
+func TestCheckFile_ContainsOnMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	a := scenario.Assertion{
+		Name:   "missing",
+		Type:   "file",
+		Target: "no-such-file.txt",
+		Expect: scenario.AssertionExpect{Contains: "anything"},
+	}
+	result := checkFile(a, dir)
+	if result.Passed {
+		t.Error("expected fail for contains check on missing file")
+	}
+	if !strings.Contains(result.Message, "does not exist") {
+		t.Errorf("expected 'does not exist' in message, got: %s", result.Message)
+	}
+}
+
+func TestCheckFile_PathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	a := scenario.Assertion{
+		Name:   "traversal",
+		Type:   "file",
+		Target: "../../etc/passwd",
+		Expect: scenario.AssertionExpect{Contains: "root"},
+	}
+	result := checkFile(a, dir)
+	if result.Passed {
+		t.Error("expected fail for path traversal attempt")
+	}
+	if !strings.Contains(result.Message, "traverses outside") {
+		t.Errorf("expected 'traverses outside' in message, got: %s", result.Message)
+	}
+}
+
+func TestCheckFile_AbsolutePath(t *testing.T) {
+	// When target is an absolute path, baseDir is not prepended.
+	tmpFile := filepath.Join(t.TempDir(), "abs-file.txt")
+	_ = os.WriteFile(tmpFile, []byte("absolute content"), 0o644)
+
+	exists := true
+	a := scenario.Assertion{
+		Name:   "abs-path",
+		Type:   "file",
+		Target: tmpFile,
+		Expect: scenario.AssertionExpect{Exists: &exists},
+	}
+	result := checkFile(a, "/some/other/dir")
+	if !result.Passed {
+		t.Errorf("expected pass for absolute path, got: %s", result.Message)
+	}
+}
+
+// ── checkTerraformOutput additional tests ─────────────────────────────────
+
+func TestCheckTerraformOutput_MissingOutput(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "missing-output",
+		Type: "terraform",
+		Expect: scenario.AssertionExpect{
+			Output: "",
+		},
+	}
+	result := checkTerraformOutput(a, map[string]string{"key": "val"})
+	if result.Passed {
+		t.Error("expected fail when expect.output is empty")
+	}
+	if !strings.Contains(result.Message, "expect.output is required") {
+		t.Errorf("expected 'expect.output is required', got: %s", result.Message)
+	}
+}
+
+func TestCheckTerraformOutput_ValueMismatch(t *testing.T) {
+	outputs := map[string]string{"region": "us-east-1"}
+	a := scenario.Assertion{
+		Name: "region-check",
+		Type: "terraform",
+		Expect: scenario.AssertionExpect{
+			Output:      "region",
+			OutputValue: "us-west-2",
+		},
+	}
+	result := checkTerraformOutput(a, outputs)
+	if result.Passed {
+		t.Error("expected fail for value mismatch")
+	}
+}
+
+func TestCheckTerraformOutput_RegexMismatch(t *testing.T) {
+	outputs := map[string]string{"endpoint": "http://plain.example.com"}
+	a := scenario.Assertion{
+		Name: "must-be-https",
+		Type: "terraform",
+		Expect: scenario.AssertionExpect{
+			Output:      "endpoint",
+			OutputMatch: `^https://`,
+		},
+	}
+	result := checkTerraformOutput(a, outputs)
+	if result.Passed {
+		t.Error("expected fail for regex mismatch")
+	}
+}
+
+func TestCheckTerraformOutput_InvalidRegex(t *testing.T) {
+	outputs := map[string]string{"val": "test"}
+	a := scenario.Assertion{
+		Name: "bad-regex",
+		Type: "terraform",
+		Expect: scenario.AssertionExpect{
+			Output:      "val",
+			OutputMatch: `[invalid`,
+		},
+	}
+	result := checkTerraformOutput(a, outputs)
+	if result.Passed {
+		t.Error("expected fail for invalid regex")
+	}
+	if !strings.Contains(result.Message, "invalid regex") {
+		t.Errorf("expected 'invalid regex' in message, got: %s", result.Message)
+	}
+}
+
+func TestCheckTerraformOutput_ValueOnlyNoRegex(t *testing.T) {
+	outputs := map[string]string{"name": "my-bucket"}
+	a := scenario.Assertion{
+		Name: "exact-match",
+		Type: "terraform",
+		Expect: scenario.AssertionExpect{
+			Output:      "name",
+			OutputValue: "my-bucket",
+		},
+	}
+	result := checkTerraformOutput(a, outputs)
+	if !result.Passed {
+		t.Errorf("expected pass for exact value match, got: %s", result.Message)
+	}
+}
+
+// ── checkPort tests ───────────────────────────────────────────────────────
+
+func TestCheckPort_Open(t *testing.T) {
+	// Start a real TCP listener.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start listener: %v", err)
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+	open := true
+	a := scenario.Assertion{
+		Name:   "port-open",
+		Type:   "port",
+		Target: addr,
+		Expect: scenario.AssertionExpect{Open: &open},
+	}
+	result := checkPort(context.Background(), a)
+	if !result.Passed {
+		t.Errorf("expected pass for open port, got: %s", result.Message)
+	}
+}
+
+func TestCheckPort_Closed(t *testing.T) {
+	// Use a port that is almost certainly not listening.
+	// Bind and immediately close to get a known-free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	open := true
+	a := scenario.Assertion{
+		Name:   "port-closed",
+		Type:   "port",
+		Target: addr,
+		Expect: scenario.AssertionExpect{Open: &open},
+	}
+	result := checkPort(context.Background(), a)
+	if result.Passed {
+		t.Error("expected fail for closed port")
+	}
+}
+
+func TestCheckPort_ExpectClosed(t *testing.T) {
+	// Bind and close to get a free port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	closed := false
+	a := scenario.Assertion{
+		Name:   "expect-closed",
+		Type:   "port",
+		Target: addr,
+		Expect: scenario.AssertionExpect{Open: &closed},
+	}
+	result := checkPort(context.Background(), a)
+	if !result.Passed {
+		t.Errorf("expected pass for correctly closed port, got: %s", result.Message)
+	}
+}
+
+func TestCheckPort_DefaultExpectOpen(t *testing.T) {
+	// When Open is nil, the default expectation is open=true.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start listener: %v", err)
+	}
+	defer ln.Close()
+
+	a := scenario.Assertion{
+		Name:   "default-open",
+		Type:   "port",
+		Target: ln.Addr().String(),
+		Expect: scenario.AssertionExpect{},
+	}
+	result := checkPort(context.Background(), a)
+	if !result.Passed {
+		t.Errorf("expected pass with default open expectation, got: %s", result.Message)
+	}
+}
+
+// ── Run integration test ──────────────────────────────────────────────────
+
+func TestRun_MultipleAssertionTypes(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "test.txt"), []byte("hello world"), 0o644)
+
+	exists := true
+	assertions := []scenario.Assertion{
+		{
+			Name:   "file-check",
+			Type:   "file",
+			Target: "test.txt",
+			Expect: scenario.AssertionExpect{
+				Exists:   &exists,
+				Contains: "hello",
+			},
+		},
+		{
+			Name: "terraform-check",
+			Type: "terraform",
+			Expect: scenario.AssertionExpect{
+				Output:      "key",
+				OutputValue: "value",
+			},
+		},
+	}
+	outputs := map[string]string{"key": "value"}
+
+	results := Run(context.Background(), assertions, outputs, dir, nil)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if !r.Passed {
+			t.Errorf("assertion %q failed: %s", r.Name, r.Message)
+		}
+	}
+	if !AllPassed(results) {
+		t.Error("expected AllPassed to return true")
+	}
+}
+
+func TestRun_SetsNameAndType(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644)
+
+	exists := true
+	assertions := []scenario.Assertion{
+		{
+			Name:   "my-assertion",
+			Type:   "file",
+			Target: "f.txt",
+			Expect: scenario.AssertionExpect{Exists: &exists},
+		},
+	}
+	results := Run(context.Background(), assertions, nil, dir, nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Name != "my-assertion" {
+		t.Errorf("expected name 'my-assertion', got %q", results[0].Name)
+	}
+	if results[0].Type != "file" {
+		t.Errorf("expected type 'file', got %q", results[0].Type)
+	}
+}
+
+func TestRun_UnsupportedType(t *testing.T) {
+	assertions := []scenario.Assertion{
+		{Name: "bad", Type: "quantum-entanglement"},
+	}
+	results := Run(context.Background(), assertions, nil, "", nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Passed {
+		t.Error("expected fail for unsupported assertion type")
+	}
+	if !strings.Contains(results[0].Message, "unsupported") {
+		t.Errorf("expected 'unsupported' in message, got: %s", results[0].Message)
+	}
+}
+
+// ── checkCommand additional tests ─────────────────────────────────────────
+
+func TestCheckCommand_MissingCommand(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "no-command",
+		Type: "command",
+		Expect: scenario.AssertionExpect{
+			Stdout: "something",
+		},
+	}
+	result := checkCommand(context.Background(), a, "", nil)
+	if result.Passed {
+		t.Error("expected fail when expect.command is empty")
+	}
+}
+
+func TestCheckCommand_ExitCode(t *testing.T) {
+	exitCode := 42
+	a := scenario.Assertion{
+		Name: "exit-check",
+		Type: "command",
+		Expect: scenario.AssertionExpect{
+			Command:  "exit 42",
+			ExitCode: &exitCode,
+		},
+	}
+	result := checkCommand(context.Background(), a, "", nil)
+	if !result.Passed {
+		t.Errorf("expected pass for expected exit code, got: %s", result.Message)
+	}
+}
+
+func TestCheckCommand_ExitCodeMismatch(t *testing.T) {
+	exitCode := 0
+	a := scenario.Assertion{
+		Name: "exit-mismatch",
+		Type: "command",
+		Expect: scenario.AssertionExpect{
+			Command:  "exit 1",
+			ExitCode: &exitCode,
+		},
+	}
+	result := checkCommand(context.Background(), a, "", nil)
+	if result.Passed {
+		t.Error("expected fail for exit code mismatch")
+	}
+}
+
+// ── GitHub Actions assertion tests ────────────────────────────────────────
+
+func TestCheckGitHubRun_Pass(t *testing.T) {
+	outputs := map[string]string{"run.conclusion": "success"}
+	a := scenario.Assertion{
+		Name: "run-check",
+		Type: "github-run",
+		Expect: scenario.AssertionExpect{Conclusion: "success"},
+	}
+	result := checkGitHubRun(a, outputs)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckGitHubRun_Fail(t *testing.T) {
+	outputs := map[string]string{"run.conclusion": "failure"}
+	a := scenario.Assertion{
+		Name: "run-check",
+		Type: "github-run",
+		Expect: scenario.AssertionExpect{Conclusion: "success"},
+	}
+	result := checkGitHubRun(a, outputs)
+	if result.Passed {
+		t.Error("expected fail for conclusion mismatch")
+	}
+}
+
+func TestCheckGitHubRun_MissingConclusion(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "run-check",
+		Type: "github-run",
+		Expect: scenario.AssertionExpect{},
+	}
+	result := checkGitHubRun(a, map[string]string{})
+	if result.Passed {
+		t.Error("expected fail when expect.conclusion is empty")
+	}
+}
+
+func TestCheckGitHubJob_Pass(t *testing.T) {
+	outputs := map[string]string{"job.build.conclusion": "success"}
+	a := scenario.Assertion{
+		Name: "job-check",
+		Type: "github-job",
+		Expect: scenario.AssertionExpect{Job: "build", Conclusion: "success"},
+	}
+	result := checkGitHubJob(a, outputs)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckGitHubJob_MissingJob(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "job-check",
+		Type: "github-job",
+		Expect: scenario.AssertionExpect{Conclusion: "success"},
+	}
+	result := checkGitHubJob(a, map[string]string{})
+	if result.Passed {
+		t.Error("expected fail when expect.job is empty")
+	}
+}
+
+func TestCheckGitHubStep_Pass(t *testing.T) {
+	outputs := map[string]string{"job.build.step.lint.conclusion": "success"}
+	a := scenario.Assertion{
+		Name: "step-check",
+		Type: "github-step",
+		Expect: scenario.AssertionExpect{Job: "build", StepName: "lint", Conclusion: "success"},
+	}
+	result := checkGitHubStep(a, outputs)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckGitHubArtifact_Pass(t *testing.T) {
+	outputs := map[string]string{"artifact.coverage-report": "present"}
+	a := scenario.Assertion{
+		Name: "artifact-check",
+		Type: "github-artifact",
+		Expect: scenario.AssertionExpect{ArtifactName: "coverage-report"},
+	}
+	result := checkGitHubArtifact(a, outputs)
+	if !result.Passed {
+		t.Errorf("expected pass, got: %s", result.Message)
+	}
+}
+
+func TestCheckGitHubArtifact_Missing(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "artifact-check",
+		Type: "github-artifact",
+		Expect: scenario.AssertionExpect{ArtifactName: "missing-artifact"},
+	}
+	result := checkGitHubArtifact(a, map[string]string{})
+	if result.Passed {
+		t.Error("expected fail for missing artifact")
+	}
+}
+
+func TestCheckGitHubArtifact_MissingName(t *testing.T) {
+	a := scenario.Assertion{
+		Name: "artifact-check",
+		Type: "github-artifact",
+		Expect: scenario.AssertionExpect{},
+	}
+	result := checkGitHubArtifact(a, map[string]string{})
+	if result.Passed {
+		t.Error("expected fail when artifact_name is empty")
 	}
 }

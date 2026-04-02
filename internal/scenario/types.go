@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -20,7 +21,24 @@ type Scenario struct {
 	Description string `yaml:"description,omitempty"`
 
 	// Backend configures the environment provider (compose, terraform, or both).
+	// Used in the old multi-file format. Mutually exclusive with Services for
+	// compose-based tests — if Services is set, the backend is generated automatically.
 	Backend Backend `yaml:"backend"`
+
+	// Services defines compose-compatible service definitions inline.
+	// When set, a temporary compose.yaml is generated and the backend is set to "compose".
+	// This is the recommended format for new tests.
+	Services map[string]ComposeService `yaml:"services,omitempty"`
+
+	// Ready defines a single readiness check that replaces setup wait loops.
+	// The engine runs Ready.Cmd repeatedly at Ready.Interval until it succeeds
+	// or Ready.Timeout elapses.
+	Ready *ReadyCheck `yaml:"ready,omitempty"`
+
+	// Run is a list of shell commands to execute after the environment is ready.
+	// These run sequentially before assertions. Optional — assertions may handle
+	// their own commands (e.g. beacon assertions run beacon scan internally).
+	Run []string `yaml:"run,omitempty"`
 
 	// Setup runs before the main commands. Use for seeding data, waiting for readiness, etc.
 	Setup []Command `yaml:"setup,omitempty"`
@@ -50,6 +68,58 @@ type Scenario struct {
 
 	// Dir is the directory containing the scenario file (set by loader, not YAML).
 	Dir string `yaml:"-"`
+}
+
+// IsUnifiedFormat returns true if this scenario uses the new unified manifest
+// format with inline service definitions.
+func (s *Scenario) IsUnifiedFormat() bool {
+	return len(s.Services) > 0
+}
+
+// ComposeService mirrors Docker Compose service configuration.
+// Fields are passed through to the generated compose.yaml as-is.
+type ComposeService struct {
+	Image       string            `yaml:"image,omitempty"`
+	Build       *ComposeBuild     `yaml:"build,omitempty"`
+	Ports       []string          `yaml:"ports,omitempty"`
+	Environment map[string]string `yaml:"environment,omitempty"`
+	Volumes     []string          `yaml:"volumes,omitempty"`
+	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	Command     any               `yaml:"command,omitempty"`
+	Entrypoint  any               `yaml:"entrypoint,omitempty"`
+	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
+	CapAdd      []string          `yaml:"cap_add,omitempty"`
+	SecurityOpt []string         `yaml:"security_opt,omitempty"`
+	Networks    []string          `yaml:"networks,omitempty"`
+	Restart     string            `yaml:"restart,omitempty"`
+}
+
+// ComposeBuild mirrors the Docker Compose build configuration.
+type ComposeBuild struct {
+	Context    string            `yaml:"context,omitempty"`
+	Dockerfile string            `yaml:"dockerfile,omitempty"`
+	Args       map[string]string `yaml:"args,omitempty"`
+}
+
+// ComposeHealth mirrors the Docker Compose healthcheck configuration.
+type ComposeHealth struct {
+	Test     []string `yaml:"test,omitempty"`
+	Interval string   `yaml:"interval,omitempty"`
+	Timeout  string   `yaml:"timeout,omitempty"`
+	Retries  int      `yaml:"retries,omitempty"`
+	Start    string   `yaml:"start_period,omitempty"`
+}
+
+// ReadyCheck defines a single readiness probe for the environment.
+type ReadyCheck struct {
+	// Cmd is the shell command to run as a health probe.
+	Cmd string `yaml:"cmd"`
+
+	// Timeout is the maximum time to wait for readiness. Defaults to 60s.
+	Timeout Duration `yaml:"timeout,omitempty"`
+
+	// Interval is the time between probe attempts. Defaults to 2s.
+	Interval Duration `yaml:"interval,omitempty"`
 }
 
 // Backend configures the environment provider.
@@ -160,6 +230,10 @@ type Assertion struct {
 	// Target is assertion-type-specific (URL for http, host:port for port, etc.)
 	Target string `yaml:"target,omitempty"`
 
+	// Args are extra CLI arguments appended to the tool invocation.
+	// Currently used by the "beacon" assertion type (e.g. ["--scanners", "cors"]).
+	Args []string `yaml:"args,omitempty"`
+
 	// Expect defines the expected result.
 	Expect AssertionExpect `yaml:"expect"`
 }
@@ -205,6 +279,26 @@ type AssertionExpect struct {
 	Job          string `yaml:"job,omitempty"`           // job name to assert on
 	StepName     string `yaml:"step_name,omitempty"`     // step name within a job
 	ArtifactName string `yaml:"artifact_name,omitempty"` // artifact that should be present
+
+	// Classify assertions — beacon classify --format json output fields
+	ProxyType       string `yaml:"proxy_type,omitempty"`       // exact match on proxy_type
+	FrameworkField  string `yaml:"framework,omitempty"`        // exact match on framework
+	CloudProviderField string `yaml:"cloud_provider,omitempty"` // exact match on cloud_provider
+	AuthSystemField string `yaml:"auth_system,omitempty"`      // exact match on auth_system
+	InfraLayerField string `yaml:"infra_layer,omitempty"`      // exact match on infra_layer
+	IsKubernetes    *bool  `yaml:"is_kubernetes,omitempty"`     // boolean match
+	IsServerless    *bool  `yaml:"is_serverless,omitempty"`     // boolean match
+	IsReverseProxy  *bool  `yaml:"is_reverse_proxy,omitempty"`  // boolean match
+	HasDMARC        *bool  `yaml:"has_dmarc,omitempty"`          // boolean match
+	BackendService  string `yaml:"backend_service,omitempty"`   // value must appear in backend_services array
+	ServiceVersion  string `yaml:"service_version,omitempty"`   // key must exist in service_versions map
+	CookieName      string `yaml:"cookie_name,omitempty"`       // value must appear in cookie_names array
+	PathResponds    string `yaml:"path_responds,omitempty"`     // path must appear in responding_paths array
+	MatchedPlaybook string `yaml:"matched_playbook,omitempty"`  // playbook must appear in matched_playbooks array
+	StatusCodeField *int   `yaml:"status_code,omitempty"`       // integer match on status_code
+	TitleContains   string `yaml:"title_contains,omitempty"`    // substring match on title
+	NotProxyType    string `yaml:"not_proxy_type,omitempty"`    // must NOT be this proxy_type
+	NotFramework    string `yaml:"not_framework,omitempty"`     // must NOT be this framework
 }
 
 // ArtifactConfig controls what gets collected after a run.
@@ -255,6 +349,16 @@ func Load(path string) (*Scenario, error) {
 		s.Timeout.Duration = 10 * time.Minute
 	}
 
+	// Apply defaults for ready check.
+	if s.Ready != nil {
+		if s.Ready.Timeout.Duration == 0 {
+			s.Ready.Timeout.Duration = 60 * time.Second
+		}
+		if s.Ready.Interval.Duration == 0 {
+			s.Ready.Interval.Duration = 2 * time.Second
+		}
+	}
+
 	return &s, nil
 }
 
@@ -268,35 +372,56 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("fixture.module is required when fixture is specified")
 		}
 	}
-	if s.Backend.Type == "" {
-		return fmt.Errorf("backend.type is required")
+
+	// New unified format: services block replaces backend for compose-based tests.
+	if s.IsUnifiedFormat() {
+		// Validate services.
+		for name, svc := range s.Services {
+			if svc.Image == "" && svc.Build == nil {
+				return fmt.Errorf("service %q must have either image or build", name)
+			}
+		}
+		// Ready check validation.
+		if s.Ready != nil && s.Ready.Cmd == "" {
+			return fmt.Errorf("ready.cmd is required when ready is specified")
+		}
+		// In unified format, run + assertions are sufficient.
+		if len(s.Run) == 0 && len(s.Commands) == 0 && len(s.Assertions) == 0 {
+			return fmt.Errorf("scenario must have at least one run command, command, or assertion")
+		}
+	} else {
+		// Old format: backend is required.
+		if s.Backend.Type == "" {
+			return fmt.Errorf("backend.type is required")
+		}
+		switch s.Backend.Type {
+		case "compose":
+			if s.Backend.ComposeFile == "" {
+				return fmt.Errorf("backend.compose_file is required for compose backend")
+			}
+		case "terraform":
+			if s.Backend.TerraformDir == "" {
+				return fmt.Errorf("backend.terraform_dir is required for terraform backend")
+			}
+		case "hybrid":
+			if s.Backend.ComposeFile == "" && s.Backend.TerraformDir == "" {
+				return fmt.Errorf("hybrid backend requires at least compose_file or terraform_dir")
+			}
+		case "github-actions":
+			if s.Backend.Repo == "" {
+				return fmt.Errorf("backend.repo is required for github-actions backend")
+			}
+			if s.Backend.Workflow == "" {
+				return fmt.Errorf("backend.workflow is required for github-actions backend")
+			}
+		default:
+			return fmt.Errorf("unsupported backend type: %q (use compose, terraform, hybrid, or github-actions)", s.Backend.Type)
+		}
+		if len(s.Commands) == 0 && len(s.Assertions) == 0 {
+			return fmt.Errorf("scenario must have at least one command or assertion")
+		}
 	}
-	switch s.Backend.Type {
-	case "compose":
-		if s.Backend.ComposeFile == "" {
-			return fmt.Errorf("backend.compose_file is required for compose backend")
-		}
-	case "terraform":
-		if s.Backend.TerraformDir == "" {
-			return fmt.Errorf("backend.terraform_dir is required for terraform backend")
-		}
-	case "hybrid":
-		if s.Backend.ComposeFile == "" && s.Backend.TerraformDir == "" {
-			return fmt.Errorf("hybrid backend requires at least compose_file or terraform_dir")
-		}
-	case "github-actions":
-		if s.Backend.Repo == "" {
-			return fmt.Errorf("backend.repo is required for github-actions backend")
-		}
-		if s.Backend.Workflow == "" {
-			return fmt.Errorf("backend.workflow is required for github-actions backend")
-		}
-	default:
-		return fmt.Errorf("unsupported backend type: %q (use compose, terraform, hybrid, or github-actions)", s.Backend.Type)
-	}
-	if len(s.Commands) == 0 && len(s.Assertions) == 0 {
-		return fmt.Errorf("scenario must have at least one command or assertion")
-	}
+
 	for i, c := range s.Commands {
 		if c.Name == "" {
 			return fmt.Errorf("command[%d].name is required", i)
@@ -310,7 +435,7 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file", "beacon",
+		case "http", "port", "command", "terraform", "file", "beacon", "classify",
 			"github-run", "github-job", "github-step", "github-artifact":
 			// valid
 		default:
@@ -327,6 +452,20 @@ func LoadDir(dir string) ([]*Scenario, error) {
 		return nil, fmt.Errorf("reading scenario directory: %w", err)
 	}
 
+	// Index YAML files so we can identify support directories (e.g. envoy/
+	// sitting next to envoy.yaml is a volume-mount directory, not a scenario dir).
+	yamlBases := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if ext == ".yaml" || ext == ".yml" {
+			yamlBases[strings.TrimSuffix(name, ext)] = true
+		}
+	}
+
 	var scenarios []*Scenario
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -338,7 +477,21 @@ func LoadDir(dir string) ([]*Scenario, error) {
 					return nil, err
 				}
 				scenarios = append(scenarios, s)
+				continue
 			}
+			// Skip support directories that share a name with a sibling
+			// YAML file (e.g. envoy/ alongside envoy.yaml contains config
+			// files mounted as volumes, not scenarios).
+			if yamlBases[entry.Name()] {
+				continue
+			}
+			// Recurse into subdirectories to support nested layouts
+			// like tests/databases/redis.yaml.
+			sub, err := LoadDir(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			scenarios = append(scenarios, sub...)
 			continue
 		}
 		name := entry.Name()

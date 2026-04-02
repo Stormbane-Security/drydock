@@ -1,0 +1,316 @@
+package scenario
+
+import (
+	"os"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+func TestGenerateComposeBytes_SingleService(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine", Ports: []string{"8080:80"}},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parsing generated YAML: %v", err)
+	}
+
+	web, ok := parsed.Services["web"]
+	if !ok {
+		t.Fatal("expected service 'web' in output")
+	}
+	if web.Image != "nginx:alpine" {
+		t.Errorf("expected image 'nginx:alpine', got %q", web.Image)
+	}
+	if len(web.Ports) != 1 || web.Ports[0] != "8080:80" {
+		t.Errorf("expected ports ['8080:80'], got %v", web.Ports)
+	}
+}
+
+func TestGenerateComposeBytes_MultipleServicesWithDependsOn(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {
+			Image:     "nginx:alpine",
+			Ports:     []string{"8080:80"},
+			DependsOn: []string{"db"},
+		},
+		"db": {
+			Image: "postgres:16",
+			Environment: map[string]string{
+				"POSTGRES_PASSWORD": "secret",
+			},
+		},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parsing generated YAML: %v", err)
+	}
+
+	if len(parsed.Services) != 2 {
+		t.Errorf("expected 2 services, got %d", len(parsed.Services))
+	}
+
+	web := parsed.Services["web"]
+	if len(web.DependsOn) != 1 || web.DependsOn[0] != "db" {
+		t.Errorf("expected depends_on ['db'], got %v", web.DependsOn)
+	}
+
+	db := parsed.Services["db"]
+	if db.Environment["POSTGRES_PASSWORD"] != "secret" {
+		t.Errorf("expected POSTGRES_PASSWORD=secret, got %q", db.Environment["POSTGRES_PASSWORD"])
+	}
+}
+
+func TestGenerateComposeBytes_AllFields(t *testing.T) {
+	services := map[string]ComposeService{
+		"app": {
+			Image: "myapp:latest",
+			Build: &ComposeBuild{
+				Context:    "./app",
+				Dockerfile: "Dockerfile.dev",
+				Args:       map[string]string{"VERSION": "1.0"},
+			},
+			Ports:       []string{"3000:3000", "3001:3001"},
+			Environment: map[string]string{"NODE_ENV": "test"},
+			Volumes:     []string{"./data:/data"},
+			DependsOn:   []string{"db", "cache"},
+			Command:     "npm start",
+			Entrypoint:  "/entrypoint.sh",
+			HealthCheck: &ComposeHealth{
+				Test:     []string{"CMD", "curl", "-f", "http://localhost:3000/health"},
+				Interval: "10s",
+				Timeout:  "5s",
+				Retries:  3,
+				Start:    "30s",
+			},
+			CapAdd:      []string{"NET_ADMIN", "SYS_PTRACE"},
+			SecurityOpt: []string{"seccomp:unconfined"},
+			Networks:    []string{"frontend"},
+			Restart:     "unless-stopped",
+		},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parsing generated YAML: %v", err)
+	}
+
+	app := parsed.Services["app"]
+	if app.Image != "myapp:latest" {
+		t.Errorf("image: got %q", app.Image)
+	}
+	if app.Build == nil {
+		t.Fatal("expected build to be set")
+	}
+	if app.Build.Context != "./app" {
+		t.Errorf("build.context: got %q", app.Build.Context)
+	}
+	if app.Build.Dockerfile != "Dockerfile.dev" {
+		t.Errorf("build.dockerfile: got %q", app.Build.Dockerfile)
+	}
+	if app.Build.Args["VERSION"] != "1.0" {
+		t.Errorf("build.args.VERSION: got %q", app.Build.Args["VERSION"])
+	}
+	if len(app.Ports) != 2 {
+		t.Errorf("expected 2 ports, got %d", len(app.Ports))
+	}
+	if app.Environment["NODE_ENV"] != "test" {
+		t.Errorf("environment.NODE_ENV: got %q", app.Environment["NODE_ENV"])
+	}
+	if len(app.Volumes) != 1 || app.Volumes[0] != "./data:/data" {
+		t.Errorf("volumes: got %v", app.Volumes)
+	}
+	if len(app.DependsOn) != 2 {
+		t.Errorf("expected 2 depends_on, got %d", len(app.DependsOn))
+	}
+	if app.Restart != "unless-stopped" {
+		t.Errorf("restart: got %q", app.Restart)
+	}
+	if app.HealthCheck == nil {
+		t.Fatal("expected healthcheck to be set")
+	}
+	if app.HealthCheck.Retries != 3 {
+		t.Errorf("healthcheck.retries: got %d", app.HealthCheck.Retries)
+	}
+	if app.HealthCheck.Interval != "10s" {
+		t.Errorf("healthcheck.interval: got %q", app.HealthCheck.Interval)
+	}
+	if len(app.CapAdd) != 2 {
+		t.Errorf("expected 2 cap_add, got %d", len(app.CapAdd))
+	}
+	if len(app.SecurityOpt) != 1 || app.SecurityOpt[0] != "seccomp:unconfined" {
+		t.Errorf("security_opt: got %v", app.SecurityOpt)
+	}
+}
+
+func TestGenerateComposeBytes_EmptyServices(t *testing.T) {
+	_, err := GenerateComposeBytes(map[string]ComposeService{})
+	if err == nil {
+		t.Fatal("expected error for empty services")
+	}
+	if !strings.Contains(err.Error(), "no services defined") {
+		t.Errorf("expected 'no services defined' error, got: %v", err)
+	}
+}
+
+func TestGenerateComposeBytes_NilServices(t *testing.T) {
+	_, err := GenerateComposeBytes(nil)
+	if err == nil {
+		t.Fatal("expected error for nil services")
+	}
+}
+
+func TestGenerateComposeFile_CreatesFile(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine"},
+	}
+
+	path, err := GenerateComposeFile(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Verify file exists on disk.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected file to exist at %s: %v", path, err)
+	}
+	if info.IsDir() {
+		t.Error("expected a file, not a directory")
+	}
+	if info.Size() == 0 {
+		t.Error("expected non-empty file")
+	}
+
+	// Verify content is valid YAML.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading file: %v", err)
+	}
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parsing generated file: %v", err)
+	}
+	if parsed.Services["web"].Image != "nginx:alpine" {
+		t.Errorf("expected image 'nginx:alpine' in file, got %q", parsed.Services["web"].Image)
+	}
+
+	// Verify filename is compose.yaml.
+	if !strings.HasSuffix(path, "/compose.yaml") {
+		t.Errorf("expected path ending with /compose.yaml, got %q", path)
+	}
+}
+
+func TestGenerateComposeFile_EmptyServices(t *testing.T) {
+	_, err := GenerateComposeFile(map[string]ComposeService{})
+	if err == nil {
+		t.Fatal("expected error for empty services")
+	}
+}
+
+func TestGenerateComposeBytes_RoundTrip(t *testing.T) {
+	// Generate bytes, parse them back, and verify the structure is intact.
+	services := map[string]ComposeService{
+		"api": {
+			Image: "api:v2",
+			Ports: []string{"9090:9090"},
+			Environment: map[string]string{
+				"DB_HOST": "db",
+				"DB_PORT": "5432",
+			},
+		},
+		"db": {
+			Image: "postgres:16",
+			Volumes: []string{"pgdata:/var/lib/postgresql/data"},
+		},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("round-trip parse: %v", err)
+	}
+
+	if len(parsed.Services) != 2 {
+		t.Errorf("expected 2 services after round-trip, got %d", len(parsed.Services))
+	}
+
+	api := parsed.Services["api"]
+	if api.Image != "api:v2" {
+		t.Errorf("api image after round-trip: %q", api.Image)
+	}
+	if api.Environment["DB_HOST"] != "db" {
+		t.Errorf("api env DB_HOST after round-trip: %q", api.Environment["DB_HOST"])
+	}
+
+	db := parsed.Services["db"]
+	if len(db.Volumes) != 1 {
+		t.Errorf("db volumes after round-trip: %v", db.Volumes)
+	}
+}
+
+func TestGenerateComposeBytes_CommandSlice(t *testing.T) {
+	services := map[string]ComposeService{
+		"app": {
+			Image:   "node:20",
+			Command: []any{"node", "server.js", "--port", "3000"},
+		},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	// Just verify it marshals without error and produces valid YAML.
+	var parsed composeFile
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parsing generated YAML: %v", err)
+	}
+	if parsed.Services["app"].Image != "node:20" {
+		t.Errorf("expected image 'node:20', got %q", parsed.Services["app"].Image)
+	}
+}
+
+func TestGenerateComposeBytes_OmitsEmptyFields(t *testing.T) {
+	services := map[string]ComposeService{
+		"minimal": {Image: "alpine"},
+	}
+
+	data, err := GenerateComposeBytes(services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+
+	content := string(data)
+	// These fields should be omitted since they are empty.
+	for _, field := range []string{"ports:", "volumes:", "depends_on:", "healthcheck:", "cap_add:", "security_opt:"} {
+		if strings.Contains(content, field) {
+			t.Errorf("expected %q to be omitted for minimal service, but found it in:\n%s", field, content)
+		}
+	}
+}

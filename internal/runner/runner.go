@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -34,11 +35,64 @@ func Run(ctx context.Context, name, command, dir string, env map[string]string) 
 		cmd.Dir = dir
 	}
 
-	// Merge environment.
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	cmd.Env = mergeEnv(env)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	result.Duration = time.Since(start)
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = -1
+			result.Error = err.Error()
+		}
 	}
+
+	return result
+}
+
+// RunExec executes a command with explicit argument separation (no shell).
+// This prevents shell injection when arguments come from user input.
+func RunExec(ctx context.Context, name string, argv []string, dir string, env map[string]string) Result {
+	start := time.Now()
+	result := Result{
+		Name:    name,
+		Command: fmt.Sprintf("%v", argv),
+	}
+
+	if len(argv) == 0 {
+		result.ExitCode = -1
+		result.Error = "empty command"
+		return result
+	}
+
+	// Resolve binary using the caller's custom PATH if provided,
+	// since exec.CommandContext uses the current process PATH.
+	binary := argv[0]
+	merged := mergeEnv(env)
+	if customPath, ok := env["PATH"]; ok && !strings.Contains(binary, "/") {
+		for _, dir := range strings.Split(customPath, ":") {
+			candidate := dir + "/" + binary
+			if fi, err := os.Stat(candidate); err == nil && !fi.IsDir() {
+				binary = candidate
+				break
+			}
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, binary, argv[1:]...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+
+	cmd.Env = merged
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -97,12 +151,46 @@ func RunAll(ctx context.Context, commands []CommandSpec, baseDir string, baseEnv
 			expectedExit = *cmd.ExpectExit
 		}
 
-		if result.ExitCode != expectedExit && !cmd.ContinueOnError {
-			result.Error = fmt.Sprintf("expected exit code %d, got %d", expectedExit, result.ExitCode)
-			break
+		if result.ExitCode != expectedExit {
+			if result.Error == "" {
+				result.Error = fmt.Sprintf("expected exit code %d, got %d", expectedExit, result.ExitCode)
+			}
+			results[len(results)-1] = result
+			if !cmd.ContinueOnError {
+				break
+			}
 		}
 	}
 	return results
+}
+
+// mergeEnv returns os.Environ() with overrides from env applied.
+// Unlike simple append, this replaces existing variables so that
+// callers can override PATH, HOME, etc.
+func mergeEnv(env map[string]string) []string {
+	if len(env) == 0 {
+		return os.Environ()
+	}
+	// Build set of override keys (uppercased for case-insensitive match on macOS).
+	base := os.Environ()
+	overrideKeys := make(map[string]bool, len(env))
+	for k := range env {
+		overrideKeys[k] = true
+	}
+	// Copy base env, skipping keys that will be overridden.
+	result := make([]string, 0, len(base)+len(env))
+	for _, entry := range base {
+		if idx := strings.IndexByte(entry, '='); idx >= 0 {
+			if overrideKeys[entry[:idx]] {
+				continue
+			}
+		}
+		result = append(result, entry)
+	}
+	for k, v := range env {
+		result = append(result, k+"="+v)
+	}
+	return result
 }
 
 // CommandSpec is the runner's view of a command to execute.
