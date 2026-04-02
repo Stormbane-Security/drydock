@@ -374,11 +374,19 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan with proper argument separation (no shell injection).
-	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
+	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich", "--no-tui"}
 	argv = append(argv, a.Args...)
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
+	// Surface beacon stderr so port-restriction debug lines are visible.
+	if r.Stderr != "" {
+		fmt.Fprintf(os.Stderr, "drydock: beacon stderr: %s\n", r.Stderr)
+	}
 	if r.ExitCode != 0 && r.Stdout == "" {
-		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
+		errDetail := r.Stderr
+		if r.Error != "" {
+			errDetail = r.Error + " | " + r.Stderr
+		}
+		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, errDetail)
 		return result
 	}
 
@@ -410,37 +418,45 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	if a.Expect.CheckID != "" {
 		found := false
 		for _, f := range findings {
-			if f.resolvedCheckID() == a.Expect.CheckID {
-				found = true
-				// If severity is also specified, verify it matches.
-				if a.Expect.Severity != "" && f.resolvedSeverity() != a.Expect.Severity {
-					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.resolvedSeverity(), a.Expect.Severity)
-					return result
-				}
-				// If evidence key/value is specified, verify it.
-				if a.Expect.EvidenceKey != "" {
-					ev, ok := f.resolvedEvidence()[a.Expect.EvidenceKey]
-					if !ok {
-						result.Message = fmt.Sprintf("finding %s missing evidence key %q", a.Expect.CheckID, a.Expect.EvidenceKey)
-						return result
-					}
-					if a.Expect.EvidenceValue != "" {
-						evStr := fmt.Sprintf("%v", ev)
-						if evStr != a.Expect.EvidenceValue {
-							result.Message = fmt.Sprintf("finding %s evidence %s=%q, expected %q", a.Expect.CheckID, a.Expect.EvidenceKey, evStr, a.Expect.EvidenceValue)
-							return result
-						}
-					}
-				}
-				break
+			if f.resolvedCheckID() != a.Expect.CheckID {
+				continue
 			}
+			// If severity is also specified, verify it matches.
+			if a.Expect.Severity != "" && f.resolvedSeverity() != a.Expect.Severity {
+				continue
+			}
+			// If evidence key/value is specified, find a finding that matches.
+			if a.Expect.EvidenceKey != "" {
+				ev, ok := f.resolvedEvidence()[a.Expect.EvidenceKey]
+				if !ok {
+					continue
+				}
+				if a.Expect.EvidenceValue != "" {
+					evStr := fmt.Sprintf("%v", ev)
+					if evStr != a.Expect.EvidenceValue {
+						continue
+					}
+				}
+			}
+			found = true
+			break
 		}
 		if !found {
 			var foundIDs []string
 			for _, f := range findings {
-				foundIDs = append(foundIDs, f.resolvedCheckID())
+				id := f.resolvedCheckID()
+				if a.Expect.EvidenceKey != "" {
+					if ev, ok := f.resolvedEvidence()[a.Expect.EvidenceKey]; ok {
+						id += fmt.Sprintf("(%s=%v)", a.Expect.EvidenceKey, ev)
+					}
+				}
+				foundIDs = append(foundIDs, id)
 			}
-			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: [%s]", a.Expect.CheckID, len(findings), strings.Join(foundIDs, ", "))
+			expected := a.Expect.CheckID
+			if a.Expect.EvidenceValue != "" {
+				expected += fmt.Sprintf(" with %s=%q", a.Expect.EvidenceKey, a.Expect.EvidenceValue)
+			}
+			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: [%s]", expected, len(findings), strings.Join(foundIDs, ", "))
 			return result
 		}
 	}
