@@ -376,6 +376,14 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Run beacon scan with proper argument separation (no shell injection).
 	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich", "--no-tui"}
 	argv = append(argv, a.Args...)
+	// Auto-acknowledge --authorized prompts in CI/drydock — the operator
+	// controls which scenarios run; the interactive prompt is for ad-hoc CLI use.
+	for _, arg := range a.Args {
+		if arg == "--authorized" {
+			env["BEACON_AUTHORIZED_ACK"] = "1"
+			break
+		}
+	}
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
 	// Surface beacon stderr so port-restriction debug lines are visible.
 	if r.Stderr != "" {

@@ -115,7 +115,16 @@ type ComposeHealth struct {
 // ReadyCheck defines a single readiness probe for the environment.
 type ReadyCheck struct {
 	// Cmd is the shell command to run as a health probe.
+	// When Container is set, the command runs inside the container via docker exec.
+	// Otherwise it runs on the host.
 	Cmd string `yaml:"cmd"`
+
+	// Container is the compose service name to exec the ready check inside.
+	// When set, Cmd runs via "docker compose exec <container> sh -c <cmd>".
+	// This is useful for protocol-aware ready checks (e.g. redis-cli PING,
+	// mysql -e 'SELECT 1') where the CLI tools exist inside the container
+	// but not on the host.
+	Container string `yaml:"container,omitempty"`
 
 	// Timeout is the maximum time to wait for readiness. Defaults to 60s.
 	Timeout Duration `yaml:"timeout,omitempty"`

@@ -404,6 +404,16 @@ func (e *Engine) runReadyCheck(ctx context.Context, s *scenario.Scenario) error 
 		return nil
 	}
 
+	// When container is set, run the check inside the container via docker compose exec.
+	// This allows protocol-aware ready checks (e.g. redis-cli PING, mysql -e 'SELECT 1')
+	// using tools inside the container image rather than requiring host installation.
+	cmd := s.Ready.Cmd
+	if s.Ready.Container != "" {
+		project := "drydock-" + s.Name
+		cmd = fmt.Sprintf("docker compose -p %s exec -T %s sh -c %q",
+			project, s.Ready.Container, s.Ready.Cmd)
+	}
+
 	deadline := time.After(s.Ready.Timeout.Duration)
 	tick := time.NewTicker(s.Ready.Interval.Duration)
 	defer tick.Stop()
@@ -416,7 +426,7 @@ func (e *Engine) runReadyCheck(ctx context.Context, s *scenario.Scenario) error 
 		case <-deadline:
 			return fmt.Errorf("timed out after %s waiting for ready check: %s", s.Ready.Timeout.Duration, lastErr)
 		case <-tick.C:
-			r := runner.Run(ctx, "ready-check", s.Ready.Cmd, s.Dir, s.Env)
+			r := runner.Run(ctx, "ready-check", cmd, s.Dir, s.Env)
 			if r.ExitCode == 0 && r.Error == "" {
 				return nil
 			}
