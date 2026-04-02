@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -443,6 +445,151 @@ func (s *Scenario) Validate() error {
 		}
 	}
 	return nil
+}
+
+// portPattern matches port numbers preceded by a colon, -p flag, or space (for nc-style commands).
+var portPattern = regexp.MustCompile(`([:,\s-][pP]\s*)(\d{2,5})`)
+
+// RemapPorts applies a port offset to all host port bindings in the scenario,
+// updating service port mappings, ready checks, assertion targets, and assertion args.
+// This enables parallel test execution without port conflicts.
+func (s *Scenario) RemapPorts(offset int) {
+	if offset == 0 || !s.IsUnifiedFormat() {
+		return
+	}
+
+	// Collect all host ports and compute their remapped values.
+	portMap := make(map[string]string) // "8080" → "8180"
+	for name, svc := range s.Services {
+		for i, p := range svc.Ports {
+			// Handle port ranges like "21100-21110:21100-21110"
+			hostContainer := strings.SplitN(p, ":", 2)
+			if len(hostContainer) != 2 {
+				continue
+			}
+			hostPart := hostContainer[0]
+			containerPart := hostContainer[1]
+
+			// Handle range format "start-end"
+			if strings.Contains(hostPart, "-") {
+				rangeParts := strings.SplitN(hostPart, "-", 2)
+				start, err1 := strconv.Atoi(rangeParts[0])
+				end, err2 := strconv.Atoi(rangeParts[1])
+				if err1 != nil || err2 != nil {
+					continue
+				}
+				newStart := start + offset
+				newEnd := end + offset
+				portMap[rangeParts[0]] = strconv.Itoa(newStart)
+				portMap[rangeParts[1]] = strconv.Itoa(newEnd)
+				svc.Ports[i] = fmt.Sprintf("%d-%d:%s", newStart, newEnd, containerPart)
+			} else {
+				port, err := strconv.Atoi(hostPart)
+				if err != nil {
+					continue
+				}
+				newPort := port + offset
+				portMap[hostPart] = strconv.Itoa(newPort)
+				svc.Ports[i] = fmt.Sprintf("%d:%s", newPort, containerPart)
+			}
+		}
+		s.Services[name] = svc
+	}
+
+	if len(portMap) == 0 {
+		return
+	}
+
+	// Rewrite ready check command.
+	if s.Ready != nil {
+		s.Ready.Cmd = remapPortsInString(s.Ready.Cmd, portMap)
+	}
+
+	// Rewrite assertion targets and args.
+	for i := range s.Assertions {
+		s.Assertions[i].Target = remapPortsInString(s.Assertions[i].Target, portMap)
+		for j := range s.Assertions[i].Args {
+			s.Assertions[i].Args[j] = remapPortsInString(s.Assertions[i].Args[j], portMap)
+		}
+	}
+
+	// Rewrite run commands.
+	for i := range s.Run {
+		s.Run[i] = remapPortsInString(s.Run[i], portMap)
+	}
+}
+
+// remapPortsInString replaces port numbers in a string using the given mapping.
+// It handles common patterns: ":PORT", "-p PORT", "-P PORT", "localhost PORT",
+// and standalone port numbers that match exactly.
+func remapPortsInString(s string, portMap map[string]string) string {
+	for old, new := range portMap {
+		// Replace :PORT (URLs, host:port targets)
+		s = strings.ReplaceAll(s, ":"+old, ":"+new)
+		// Replace -p PORT and -P PORT (CLI flags)
+		s = strings.ReplaceAll(s, "-p "+old, "-p "+new)
+		s = strings.ReplaceAll(s, "-P "+old, "-P "+new)
+		// Replace "localhost PORT" (nc-style)
+		s = strings.ReplaceAll(s, "localhost "+old, "localhost "+new)
+		// Replace "--port PORT" (generic CLI)
+		s = strings.ReplaceAll(s, "--port "+old, "--port "+new)
+	}
+	// Suppress unused portPattern warning — reserved for future use.
+	_ = portPattern
+	return s
+}
+
+// Clone returns a deep copy of the scenario suitable for mutation (e.g. port remapping).
+func (s *Scenario) Clone() *Scenario {
+	c := *s // shallow copy
+
+	// Deep copy Services map.
+	if s.Services != nil {
+		c.Services = make(map[string]ComposeService, len(s.Services))
+		for k, v := range s.Services {
+			// Deep copy Ports slice.
+			if v.Ports != nil {
+				ports := make([]string, len(v.Ports))
+				copy(ports, v.Ports)
+				v.Ports = ports
+			}
+			// Deep copy Volumes slice.
+			if v.Volumes != nil {
+				vols := make([]string, len(v.Volumes))
+				copy(vols, v.Volumes)
+				v.Volumes = vols
+			}
+			c.Services[k] = v
+		}
+	}
+
+	// Deep copy Ready.
+	if s.Ready != nil {
+		rc := *s.Ready
+		c.Ready = &rc
+	}
+
+	// Deep copy Assertions.
+	if s.Assertions != nil {
+		c.Assertions = make([]Assertion, len(s.Assertions))
+		for i, a := range s.Assertions {
+			c.Assertions[i] = a
+			if a.Args != nil {
+				args := make([]string, len(a.Args))
+				copy(args, a.Args)
+				c.Assertions[i].Args = args
+			}
+		}
+	}
+
+	// Deep copy Run.
+	if s.Run != nil {
+		run := make([]string, len(s.Run))
+		copy(run, s.Run)
+		c.Run = run
+	}
+
+	return &c
 }
 
 // LoadDir loads all scenario YAML files from a directory.

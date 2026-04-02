@@ -184,7 +184,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 		"web": {Image: "nginx:alpine"},
 	}
 
-	path, err := GenerateComposeFile(services)
+	path, err := GenerateComposeFile(services, t.TempDir())
 	if err != nil {
 		t.Fatalf("GenerateComposeFile: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 }
 
 func TestGenerateComposeFile_EmptyServices(t *testing.T) {
-	_, err := GenerateComposeFile(map[string]ComposeService{})
+	_, err := GenerateComposeFile(map[string]ComposeService{}, ".")
 	if err == nil {
 		t.Fatal("expected error for empty services")
 	}

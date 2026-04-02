@@ -23,6 +23,20 @@ import (
 
 // Run evaluates all assertions in a scenario against the live environment.
 func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[string]string, baseDir string, env map[string]string) []artifact.AssertionResult {
+	// Give each scenario its own beacon database to avoid SQLITE_BUSY when
+	// multiple beacon scans run in parallel across different scenarios.
+	if env == nil {
+		env = make(map[string]string)
+	}
+	if _, ok := env["BEACON_STORE_PATH"]; !ok {
+		tmpDB, err := os.CreateTemp("", "drydock-beacon-*.db")
+		if err == nil {
+			tmpDB.Close()
+			env["BEACON_STORE_PATH"] = tmpDB.Name()
+			defer os.Remove(tmpDB.Name())
+		}
+	}
+
 	var results []artifact.AssertionResult
 	for _, a := range assertions {
 		var result artifact.AssertionResult
@@ -274,12 +288,80 @@ func checkFile(a scenario.Assertion, baseDir string) artifact.AssertionResult {
 // ── Beacon assertion ─────────────────────────────────────────────────────
 
 // beaconFinding matches the JSON output structure of beacon scan --format json.
+// Beacon wraps findings in an EnrichedFinding envelope: {"finding": {...}, "explanation": "..."}.
+// The actual check_id, severity, etc. are nested inside the "finding" key.
 type beaconFinding struct {
+	// Nested finding — beacon's enriched output format.
+	// Severity may be int (beacon's Finding type: 0=info..4=critical) or string in test fixtures.
+	Finding struct {
+		CheckID  string         `json:"check_id"`
+		Severity any            `json:"severity"`
+		Title    string         `json:"title"`
+		Asset    string         `json:"asset"`
+		Evidence map[string]any `json:"evidence"`
+	} `json:"finding"`
+
+	// Top-level fallback fields for raw output formats.
 	CheckID  string         `json:"check_id"`
-	Severity string         `json:"severity"`
+	Severity any            `json:"severity"`
 	Title    string         `json:"title"`
 	Asset    string         `json:"asset"`
 	Evidence map[string]any `json:"evidence"`
+}
+
+// resolvedCheckID returns the check_id from whichever level it was parsed at.
+func (f beaconFinding) resolvedCheckID() string {
+	if f.Finding.CheckID != "" {
+		return f.Finding.CheckID
+	}
+	return f.CheckID
+}
+
+// parseSeverity converts a severity value (int or string) to a canonical string label.
+func parseSeverity(v any) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case float64: // JSON numbers unmarshal to float64 via any
+		switch int(s) {
+		case 4:
+			return "critical"
+		case 3:
+			return "high"
+		case 2:
+			return "medium"
+		case 1:
+			return "low"
+		default:
+			return "info"
+		}
+	default:
+		return "info"
+	}
+}
+
+// resolvedSeverity returns severity as a string label from the nested or top-level field.
+func (f beaconFinding) resolvedSeverity() string {
+	if f.Finding.CheckID != "" {
+		return parseSeverity(f.Finding.Severity)
+	}
+	return parseSeverity(f.Severity)
+}
+
+// resolvedEvidence returns evidence from the nested or top-level field.
+func (f beaconFinding) resolvedEvidence() map[string]any {
+	if f.Finding.Evidence != nil {
+		return f.Finding.Evidence
+	}
+	return f.Evidence
+}
+
+// resolvedTitle returns the title from the nested or top-level field.
+func (f beaconFinding) resolvedTitle() string {
+	if f.Finding.Title != "" {
+		return f.Finding.Title
+	}
+	return f.Title
 }
 
 func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
@@ -292,7 +374,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan with proper argument separation (no shell injection).
-	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--skip-enrichment"}
+	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
 	if r.ExitCode != 0 && r.Stdout == "" {
@@ -308,7 +390,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 			Findings []beaconFinding `json:"findings"`
 		}
 		if err2 := json.Unmarshal([]byte(r.Stdout), &wrapper); err2 != nil {
-			result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
+			result.Message = fmt.Sprintf("failed to parse beacon output: %v (wrapper: %v)\nraw output: %.500s", err, err2, r.Stdout)
 			return result
 		}
 		findings = wrapper.Findings
@@ -328,16 +410,16 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	if a.Expect.CheckID != "" {
 		found := false
 		for _, f := range findings {
-			if f.CheckID == a.Expect.CheckID {
+			if f.resolvedCheckID() == a.Expect.CheckID {
 				found = true
 				// If severity is also specified, verify it matches.
-				if a.Expect.Severity != "" && f.Severity != a.Expect.Severity {
-					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.Severity, a.Expect.Severity)
+				if a.Expect.Severity != "" && f.resolvedSeverity() != a.Expect.Severity {
+					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.resolvedSeverity(), a.Expect.Severity)
 					return result
 				}
 				// If evidence key/value is specified, verify it.
 				if a.Expect.EvidenceKey != "" {
-					ev, ok := f.Evidence[a.Expect.EvidenceKey]
+					ev, ok := f.resolvedEvidence()[a.Expect.EvidenceKey]
 					if !ok {
 						result.Message = fmt.Sprintf("finding %s missing evidence key %q", a.Expect.CheckID, a.Expect.EvidenceKey)
 						return result
@@ -356,9 +438,9 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		if !found {
 			var foundIDs []string
 			for _, f := range findings {
-				foundIDs = append(foundIDs, f.CheckID)
+				foundIDs = append(foundIDs, f.resolvedCheckID())
 			}
-			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: %v", a.Expect.CheckID, len(findings), foundIDs)
+			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: [%s]", a.Expect.CheckID, len(findings), strings.Join(foundIDs, ", "))
 			return result
 		}
 	}
@@ -366,8 +448,8 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Check that a specific check_id is NOT present.
 	if a.Expect.NotCheckID != "" {
 		for _, f := range findings {
-			if f.CheckID == a.Expect.NotCheckID {
-				result.Message = fmt.Sprintf("finding %s should not be present but was found: %s", a.Expect.NotCheckID, f.Title)
+			if f.resolvedCheckID() == a.Expect.NotCheckID {
+				result.Message = fmt.Sprintf("finding %s should not be present but was found: %s", a.Expect.NotCheckID, f.resolvedTitle())
 				return result
 			}
 		}

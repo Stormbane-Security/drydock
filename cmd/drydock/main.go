@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -22,7 +23,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/stormbane-security/drydock/internal/engine"
@@ -81,6 +84,7 @@ Usage:
 
 Run flags:
   --tags <tag1,tag2>      Only run scenarios with matching tags
+  --parallel N            Run N scenarios concurrently (default: 1, 0 = NumCPU)
   --artifacts <dir>       Artifact output directory (default: .drydock/runs)
   --json                  Output results as JSON`)
 }
@@ -119,10 +123,11 @@ func cmdRun(args []string) {
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
+	parallel := fs.Int("parallel", 1, "number of scenarios to run concurrently (0 = NumCPU)")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")
+		fatalf("usage: drydock run [--tags <tags>] [--parallel N] <scenario-path>")
 	}
 
 	requireDocker()
@@ -165,37 +170,143 @@ func cmdRun(args []string) {
 		}
 	}
 
-	// Run scenarios.
-	var passed, failed, errored int
-	for _, s := range scenarios {
-		fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
-		record, err := eng.Run(ctx, s)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-			errored++
-			continue
-		}
+	workers := *parallel
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
 
-		if *jsonOutput {
-			data, _ := json.MarshalIndent(record, "", "  ")
-			fmt.Println(string(data))
-		}
+	if workers == 1 || len(scenarios) == 1 {
+		// Sequential execution — stream output directly.
+		var passed, failed, errored int
+		for _, s := range scenarios {
+			fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
+			record, err := eng.Run(ctx, s)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				errored++
+				continue
+			}
 
-		switch record.Status {
-		case "pass":
-			passed++
-			fmt.Fprintf(os.Stderr, "✓ %s PASSED (%.1fs)\n", s.Name, record.Duration.Seconds())
-		case "fail":
-			failed++
-			fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
-			for _, ar := range record.AssertionResults {
-				if !ar.Passed {
-					fmt.Fprintf(os.Stderr, "  FAIL: %s — %s\n", ar.Name, ar.Message)
+			if *jsonOutput {
+				data, _ := json.MarshalIndent(record, "", "  ")
+				fmt.Println(string(data))
+			}
+
+			switch record.Status {
+			case "pass":
+				passed++
+				fmt.Fprintf(os.Stderr, "✓ %s PASSED (%.1fs)\n", s.Name, record.Duration.Seconds())
+			case "fail":
+				failed++
+				fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+				for _, ar := range record.AssertionResults {
+					if !ar.Passed {
+						fmt.Fprintf(os.Stderr, "  FAIL: %s — %s\n", ar.Name, ar.Message)
+					}
+				}
+			default:
+				errored++
+				fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+			}
+		}
+		fmt.Fprintf(os.Stderr, "\n═══ Results: %d passed, %d failed, %d errors ═══\n", passed, failed, errored)
+		if failed > 0 || errored > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Parallel execution with buffered output per scenario.
+	fmt.Fprintf(os.Stderr, "drydock: running %d scenarios with %d workers\n", len(scenarios), workers)
+
+	type result struct {
+		index    int
+		scenario *scenario.Scenario
+		output   string // buffered stderr output
+		json     string // buffered JSON output (if --json)
+		status   string // "pass", "fail", "error"
+	}
+
+	results := make([]result, len(scenarios))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var outputMu sync.Mutex
+
+	for i, s := range scenarios {
+		wg.Add(1)
+		go func(idx int, sc *scenario.Scenario) {
+			defer wg.Done()
+
+			sem <- struct{}{}        // acquire worker slot
+			defer func() { <-sem }() // release worker slot
+
+			// Clone and remap ports to avoid collisions between parallel scenarios.
+			sc = sc.Clone()
+			sc.RemapPorts(idx * 100)
+
+			// Each goroutine gets its own engine with output directed to a buffer,
+			// so engine log messages don't interleave between scenarios.
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "\n═══ Running: %s ═══\n", sc.Name)
+			workerEng := engine.New(*artifactDir)
+			workerEng.SetOutput(&buf)
+
+			record, err := workerEng.Run(ctx, sc)
+
+			r := result{index: idx, scenario: sc}
+
+			if err != nil {
+				fmt.Fprintf(&buf, "ERROR: %v\n", err)
+				r.status = "error"
+			} else {
+				if *jsonOutput {
+					data, _ := json.MarshalIndent(record, "", "  ")
+					r.json = string(data)
+				}
+
+				switch record.Status {
+				case "pass":
+					r.status = "pass"
+					fmt.Fprintf(&buf, "✓ %s PASSED (%.1fs)\n", sc.Name, record.Duration.Seconds())
+				case "fail":
+					r.status = "fail"
+					fmt.Fprintf(&buf, "✗ %s FAILED: %s (%.1fs)\n", sc.Name, record.Error, record.Duration.Seconds())
+					for _, ar := range record.AssertionResults {
+						if !ar.Passed {
+							fmt.Fprintf(&buf, "  FAIL: %s — %s\n", ar.Name, ar.Message)
+						}
+					}
+				default:
+					r.status = "error"
+					fmt.Fprintf(&buf, "! %s ERROR: %s (%.1fs)\n", sc.Name, record.Error, record.Duration.Seconds())
 				}
 			}
+
+			r.output = buf.String()
+
+			// Print output immediately when a scenario finishes (mutex prevents interleaving).
+			outputMu.Lock()
+			fmt.Fprint(os.Stderr, r.output)
+			if r.json != "" {
+				fmt.Println(r.json)
+			}
+			outputMu.Unlock()
+
+			results[idx] = r
+		}(i, s)
+	}
+
+	wg.Wait()
+
+	var passed, failed, errored int
+	for _, r := range results {
+		switch r.status {
+		case "pass":
+			passed++
+		case "fail":
+			failed++
 		default:
 			errored++
-			fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
 		}
 	}
 

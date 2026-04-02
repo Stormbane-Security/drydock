@@ -223,15 +223,17 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 	// Phase 6: Run assertions.
 	if len(s.Assertions) > 0 {
 		e.log("running %d assertions...", len(s.Assertions))
-		assertResults := assertion.Run(ctx, s.Assertions, allOutputs, s.Dir, s.Env)
-		record.AssertionResults = assertResults
-
-		for _, r := range assertResults {
-			status := "PASS"
-			if !r.Passed {
-				status = "FAIL"
+		for i, a := range s.Assertions {
+			e.log("  [%d/%d] %s (%s)...", i+1, len(s.Assertions), a.Name, a.Type)
+			results := assertion.Run(ctx, []scenario.Assertion{a}, allOutputs, s.Dir, s.Env)
+			for _, r := range results {
+				record.AssertionResults = append(record.AssertionResults, r)
+				status := "PASS"
+				if !r.Passed {
+					status = "FAIL"
+				}
+				e.log("  [%s] %s: %s", status, r.Name, r.Message)
 			}
-			e.log("  [%s] %s: %s", status, r.Name, r.Message)
 		}
 	}
 
@@ -320,7 +322,7 @@ func (e *Engine) ListRuns() ([]string, error) {
 func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error) {
 	// Unified format: generate compose.yaml from inline services.
 	if s.IsUnifiedFormat() {
-		composeFile, err := scenario.GenerateComposeFile(s.Services)
+		composeFile, err := scenario.GenerateComposeFile(s.Services, s.Dir)
 		if err != nil {
 			return nil, fmt.Errorf("generating compose file: %w", err)
 		}
