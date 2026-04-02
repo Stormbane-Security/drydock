@@ -63,8 +63,9 @@ func parsePortSpec(spec string) (host, container string) {
 // GenerateComposeFile marshals the services map into a valid Docker Compose v3
 // YAML file, writes it to a temp directory, and returns the file path and
 // port plan. All host ports are rewritten to ephemeral (0) to avoid conflicts.
+// Volume paths starting with "./" are resolved to absolute paths relative to baseDir.
 // The caller is responsible for removing the temp directory when done.
-func GenerateComposeFile(services map[string]ComposeService) (string, *PortPlan, error) {
+func GenerateComposeFile(services map[string]ComposeService, baseDir string) (string, *PortPlan, error) {
 	if len(services) == 0 {
 		return "", nil, fmt.Errorf("no services defined")
 	}
@@ -87,12 +88,28 @@ func GenerateComposeFile(services map[string]ComposeService) (string, *PortPlan,
 			ephemeralPorts[i] = "0:" + container
 		}
 
+		// Resolve relative volume paths to absolute paths.
+		resolvedVolumes := make([]string, len(svc.Volumes))
+		for i, v := range svc.Volumes {
+			resolvedVolumes[i] = resolveVolumePath(v, baseDir)
+		}
+
+		// Resolve relative build context paths.
+		var resolvedBuild *ComposeBuild
+		if svc.Build != nil {
+			resolvedBuild = &ComposeBuild{
+				Context:    resolveRelativePath(svc.Build.Context, baseDir),
+				Dockerfile: svc.Build.Dockerfile,
+				Args:       svc.Build.Args,
+			}
+		}
+
 		out.Services[name] = composeServiceOut{
 			Image:       svc.Image,
-			Build:       svc.Build,
+			Build:       resolvedBuild,
 			Ports:       ephemeralPorts,
 			Environment: svc.Environment,
-			Volumes:     svc.Volumes,
+			Volumes:     resolvedVolumes,
 			DependsOn:   svc.DependsOn,
 			Command:     svc.Command,
 			Entrypoint:  svc.Entrypoint,
@@ -121,6 +138,40 @@ func GenerateComposeFile(services map[string]ComposeService) (string, *PortPlan,
 	}
 
 	return path, plan, nil
+}
+
+// resolveVolumePath converts relative host paths in volume mounts to absolute
+// paths relative to baseDir. Format: "HOST:CONTAINER[:OPTIONS]".
+func resolveVolumePath(vol string, baseDir string) string {
+	if baseDir == "" {
+		return vol
+	}
+	parts := strings.SplitN(vol, ":", 3)
+	if len(parts) < 2 {
+		return vol
+	}
+	hostPath := parts[0]
+	hostPath = resolveRelativePath(hostPath, baseDir)
+	parts[0] = hostPath
+	return strings.Join(parts, ":")
+}
+
+// resolveRelativePath converts a relative path to absolute relative to baseDir.
+func resolveRelativePath(p string, baseDir string) string {
+	if baseDir == "" || filepath.IsAbs(p) {
+		return p
+	}
+	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") || (!strings.HasPrefix(p, "/") && !strings.Contains(p, ":")) {
+		joined := filepath.Join(baseDir, p)
+		// Ensure the result is absolute — if baseDir was relative, resolve from cwd.
+		if !filepath.IsAbs(joined) {
+			if abs, err := filepath.Abs(joined); err == nil {
+				return abs
+			}
+		}
+		return joined
+	}
+	return p
 }
 
 // GenerateComposeBytes marshals the services map into Docker Compose v3 YAML bytes.

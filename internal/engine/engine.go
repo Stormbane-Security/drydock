@@ -330,7 +330,7 @@ func (e *Engine) ListRuns() ([]string, error) {
 func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error) {
 	// Unified format: generate compose.yaml from inline services.
 	if s.IsUnifiedFormat() {
-		composeFile, portPlan, err := scenario.GenerateComposeFile(s.Services)
+		composeFile, portPlan, err := scenario.GenerateComposeFile(s.Services, s.Dir)
 		if err != nil {
 			return nil, fmt.Errorf("generating compose file: %w", err)
 		}
