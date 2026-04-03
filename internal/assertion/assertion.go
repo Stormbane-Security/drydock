@@ -328,6 +328,12 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		beaconEnv[k] = v
 	}
 	beaconEnv["BEACON_AUTHORIZED_ACK"] = "1"
+	// Ensure $GOPATH/bin is on PATH so go-installed binaries are found.
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		beaconEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(gopath, "bin")
+	} else if home := os.Getenv("HOME"); home != "" {
+		beaconEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(home, "go", "bin")
+	}
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, beaconEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
@@ -462,7 +468,16 @@ func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, en
 
 	// Run beacon classify with proper argument separation (no shell injection).
 	argv := []string{"beacon", "classify", a.Target, "--format", "json"}
-	r := runner.RunExec(ctx, "beacon-classify", argv, baseDir, env)
+	classifyEnv := make(map[string]string)
+	for k, v := range env {
+		classifyEnv[k] = v
+	}
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		classifyEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(gopath, "bin")
+	} else if home := os.Getenv("HOME"); home != "" {
+		classifyEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(home, "go", "bin")
+	}
+	r := runner.RunExec(ctx, "beacon-classify", argv, baseDir, classifyEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon classify failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result

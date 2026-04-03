@@ -594,7 +594,10 @@ func substitutePort(s string, subs map[string]string) string {
 		if intended == actual {
 			continue
 		}
+		// Replace colon-separated ports (URLs, host:port).
 		s = strings.ReplaceAll(s, ":"+intended, ":"+actual)
+		// Replace space-separated ports (nc, netcat, nmap-style commands).
+		s = strings.ReplaceAll(s, " "+intended, " "+actual)
 	}
 	return s
 }
