@@ -25,7 +25,7 @@ type composeServiceOut struct {
 	Ports       []string          `yaml:"ports,omitempty"`
 	Environment map[string]string `yaml:"environment,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
-	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	DependsOn   DependsOn         `yaml:"depends_on,omitempty"`
 	Command     any               `yaml:"command,omitempty"`
 	Entrypoint  any               `yaml:"entrypoint,omitempty"`
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`

@@ -162,6 +162,14 @@ func checkCommand(ctx context.Context, a scenario.Assertion, baseDir string, env
 		return result
 	}
 
+	// Per-assertion timeout: default 60s, overridable via expect.timeout.
+	assertTimeout := 60 * time.Second
+	if a.Expect.Timeout.Duration > 0 {
+		assertTimeout = a.Expect.Timeout.Duration
+	}
+	ctx, cancel := context.WithTimeout(ctx, assertTimeout)
+	defer cancel()
+
 	r := runner.Run(ctx, a.Name, a.Expect.Command, baseDir, env)
 
 	expectedExit := 0

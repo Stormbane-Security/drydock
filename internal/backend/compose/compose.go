@@ -63,8 +63,14 @@ func (b *Backend) run(ctx context.Context, args ...string) (string, string, erro
 	return stdout.String(), stderr.String(), err
 }
 
-// Create runs `docker compose up -d`.
+// Create runs `docker compose up -d`. It first tears down any leftover
+// containers from a previous run with the same project name, ensuring a
+// clean state even if a prior run was killed without cleanup.
 func (b *Backend) Create(ctx context.Context) error {
+	// Pre-run cleanup: remove any orphaned containers from a previous run.
+	// Ignore errors — there may be nothing to clean up.
+	_, _, _ = b.run(ctx, "down", "-v", "--remove-orphans", "--timeout", "5")
+
 	_, stderr, err := b.run(ctx, "up", "-d", "--wait", "--build")
 	if err != nil {
 		return fmt.Errorf("compose up: %s: %w", stderr, err)

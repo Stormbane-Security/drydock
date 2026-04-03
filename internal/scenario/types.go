@@ -12,6 +12,94 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DependsOn handles both Docker Compose depends_on formats:
+//
+//	List form:  depends_on: [db, cache]
+//	Map form:   depends_on: {db: {condition: service_healthy}}
+type DependsOn struct {
+	Entries []DependsOnEntry
+}
+
+// DependsOnEntry is a single service dependency with an optional condition.
+type DependsOnEntry struct {
+	Service   string
+	Condition string // e.g. "service_started", "service_healthy"
+}
+
+// ServiceNames returns just the service names.
+func (d DependsOn) ServiceNames() []string {
+	names := make([]string, len(d.Entries))
+	for i, e := range d.Entries {
+		names[i] = e.Service
+	}
+	return names
+}
+
+func (d *DependsOn) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		// List form: ["db", "cache"]
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		d.Entries = make([]DependsOnEntry, len(list))
+		for i, s := range list {
+			d.Entries[i] = DependsOnEntry{Service: s}
+		}
+		return nil
+	case yaml.MappingNode:
+		// Map form: {db: {condition: service_healthy}}
+		var m map[string]struct {
+			Condition string `yaml:"condition"`
+		}
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		d.Entries = make([]DependsOnEntry, 0, len(m))
+		for svc, cfg := range m {
+			d.Entries = append(d.Entries, DependsOnEntry{
+				Service:   svc,
+				Condition: cfg.Condition,
+			})
+		}
+		return nil
+	default:
+		return fmt.Errorf("depends_on must be a list or map, got %v", value.Kind)
+	}
+}
+
+func (d DependsOn) MarshalYAML() (any, error) {
+	if len(d.Entries) == 0 {
+		return nil, nil
+	}
+	// If any entry has a condition, marshal as map.
+	hasCondition := false
+	for _, e := range d.Entries {
+		if e.Condition != "" {
+			hasCondition = true
+			break
+		}
+	}
+	if !hasCondition {
+		return d.ServiceNames(), nil
+	}
+	m := make(map[string]map[string]string, len(d.Entries))
+	for _, e := range d.Entries {
+		if e.Condition != "" {
+			m[e.Service] = map[string]string{"condition": e.Condition}
+		} else {
+			m[e.Service] = map[string]string{"condition": "service_started"}
+		}
+	}
+	return m, nil
+}
+
+// IsEmpty returns true if there are no dependencies.
+func (d DependsOn) IsEmpty() bool {
+	return len(d.Entries) == 0
+}
+
 // Scenario is the top-level declarative test definition.
 type Scenario struct {
 	// Name identifies this scenario. Must be unique within a run.
@@ -87,7 +175,7 @@ type ComposeService struct {
 	Ports       []string          `yaml:"ports,omitempty"`
 	Environment map[string]string `yaml:"environment,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
-	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	DependsOn   DependsOn         `yaml:"depends_on,omitempty"`
 	Command     any               `yaml:"command,omitempty"`
 	Entrypoint  any               `yaml:"entrypoint,omitempty"`
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
@@ -274,10 +362,11 @@ type AssertionExpect struct {
 	Open   *bool `yaml:"open,omitempty"`
 
 	// Command assertions
-	Command  string `yaml:"command,omitempty"`
-	ExitCode *int   `yaml:"exit_code,omitempty"`
-	Stdout   string `yaml:"stdout,omitempty"`
-	NotStdout string `yaml:"not_stdout,omitempty"`
+	Command  string   `yaml:"command,omitempty"`
+	ExitCode *int     `yaml:"exit_code,omitempty"`
+	Stdout   string   `yaml:"stdout,omitempty"`
+	NotStdout string  `yaml:"not_stdout,omitempty"`
+	Timeout  Duration `yaml:"timeout,omitempty"` // per-assertion timeout (default 60s)
 
 	// Terraform assertions
 	Output      string `yaml:"output,omitempty"`       // terraform output name
