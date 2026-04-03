@@ -99,7 +99,7 @@ func TestGenerateComposeBytes_AllFields(t *testing.T) {
 			},
 			CapAdd:      []string{"NET_ADMIN", "SYS_PTRACE"},
 			SecurityOpt: []string{"seccomp:unconfined"},
-			Networks:    []string{"frontend"},
+			Networks:    map[string]ComposeServiceNetwork{"frontend": {}},
 			Restart:     "unless-stopped",
 		},
 	}
@@ -184,7 +184,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 		"web": {Image: "nginx:alpine"},
 	}
 
-	path, err := GenerateComposeFile(services)
+	path, _, err := GenerateComposeFile(services, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("GenerateComposeFile: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 }
 
 func TestGenerateComposeFile_EmptyServices(t *testing.T) {
-	_, err := GenerateComposeFile(map[string]ComposeService{})
+	_, _, err := GenerateComposeFile(map[string]ComposeService{}, t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("expected error for empty services")
 	}

@@ -329,10 +329,18 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 	beaconEnv["BEACON_AUTHORIZED_ACK"] = "1"
 	// Ensure $GOPATH/bin is on PATH so go-installed binaries are found.
+	// Append to existing PATH (which may already include test overrides) rather
+	// than replacing it.
+	existingPath := beaconEnv["PATH"]
+	if existingPath == "" {
+		existingPath = os.Getenv("PATH")
+	}
 	if gopath := os.Getenv("GOPATH"); gopath != "" {
-		beaconEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(gopath, "bin")
+		beaconEnv["PATH"] = existingPath + ":" + filepath.Join(gopath, "bin")
 	} else if home := os.Getenv("HOME"); home != "" {
-		beaconEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(home, "go", "bin")
+		beaconEnv["PATH"] = existingPath + ":" + filepath.Join(home, "go", "bin")
+	} else {
+		beaconEnv["PATH"] = existingPath
 	}
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, beaconEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
@@ -348,7 +356,8 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		var enrichedWrapper struct {
 			Findings []beaconEnrichedFinding `json:"findings"`
 		}
-		if err2 := json.Unmarshal([]byte(r.Stdout), &enrichedWrapper); err2 == nil && len(enrichedWrapper.Findings) > 0 {
+		if err2 := json.Unmarshal([]byte(r.Stdout), &enrichedWrapper); err2 == nil &&
+			len(enrichedWrapper.Findings) > 0 && enrichedWrapper.Findings[0].Finding.CheckID != "" {
 			for _, ef := range enrichedWrapper.Findings {
 				findings = append(findings, ef.Finding)
 			}
