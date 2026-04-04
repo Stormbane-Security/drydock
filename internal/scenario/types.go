@@ -157,6 +157,28 @@ type Scenario struct {
 	// Tags enable filtering scenarios by category.
 	Tags []string `yaml:"tags,omitempty"`
 
+	// Matrix defines parameterized variants for this scenario.
+	// Each key maps to a list of values. When matrix is set, the scenario
+	// is expanded into one run per combination. Services can reference
+	// matrix values via ${matrix.<key>} in their `from` field.
+	//
+	// Example:
+	//   matrix:
+	//     database: [postgres, mysql]
+	//   services:
+	//     db:
+	//       from: databases/${matrix.database}
+	//
+	// Run all: drydock run scenario.yaml
+	// Run one: drydock run scenario.yaml --matrix database=postgres
+	Matrix map[string][]string `yaml:"matrix,omitempty"`
+
+	// Weight is an optional scheduling hint. When multiple scenarios are queued,
+	// the runner sorts by descending weight so that heavy/slow tests (large images,
+	// long startup) begin first. Defaults to 0. Typical values: 10 (light),
+	// 50 (medium), 100 (heavy like GitLab/Confluence).
+	Weight int `yaml:"weight,omitempty"`
+
 	// Dir is the directory containing the scenario file (set by loader, not YAML).
 	Dir string `yaml:"-"`
 }
@@ -170,6 +192,11 @@ func (s *Scenario) IsUnifiedFormat() bool {
 // ComposeService mirrors Docker Compose service configuration.
 // Fields are passed through to the generated compose.yaml as-is.
 type ComposeService struct {
+	// From loads a base service definition from a layer file.
+	// The path is relative to the layer search directories (e.g. "databases/postgres").
+	// Layer fields are used as defaults; any fields set on this service override them.
+	From        string            `yaml:"from,omitempty"`
+
 	Image       string            `yaml:"image,omitempty"`
 	Build       *ComposeBuild     `yaml:"build,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
@@ -345,8 +372,14 @@ type Assertion struct {
 	// Currently used by the "beacon" assertion type (e.g. ["--scanners", "cors"]).
 	Args []string `yaml:"args,omitempty"`
 
-	// Expect defines the expected result.
+	// Expect defines the expected result (single expectation).
 	Expect AssertionExpect `yaml:"expect"`
+
+	// Expectations defines multiple expected results checked against a single
+	// tool invocation. Used with beacon assertions to run one scan and verify
+	// multiple findings exist. If both Expect and Expectations are set,
+	// Expectations takes precedence for beacon assertions.
+	Expectations []AssertionExpect `yaml:"expectations,omitempty"`
 }
 
 // AssertionExpect defines expected outcomes for assertions.
@@ -489,6 +522,10 @@ func (s *Scenario) Validate() error {
 	if s.IsUnifiedFormat() {
 		// Validate services.
 		for name, svc := range s.Services {
+			// Services with from: get image/build from the layer after resolution.
+			if svc.From != "" {
+				continue
+			}
 			if svc.Image == "" && svc.Build == nil {
 				return fmt.Errorf("service %q must have either image or build", name)
 			}

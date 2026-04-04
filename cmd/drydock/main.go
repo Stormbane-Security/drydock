@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -81,6 +82,7 @@ Usage:
 
 Run flags:
   --tags <tag1,tag2>      Only run scenarios with matching tags
+  --matrix <k=v,...>      Filter matrix variants (e.g. database=postgres)
   --artifacts <dir>       Artifact output directory (default: .drydock/runs)
   --json                  Output results as JSON`)
 }
@@ -117,12 +119,13 @@ func requireDocker() {
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
+	matrixFilter := fs.String("matrix", "", "filter matrix variants (e.g. database=postgres,cache=redis)")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")
+		fatalf("usage: drydock run [--tags <tags>] [--matrix <key=val,...>] <scenario-path>")
 	}
 
 	requireDocker()
@@ -141,9 +144,26 @@ func cmdRun(args []string) {
 		scenarios = filtered
 	}
 
+	// Filter by matrix values.
+	if *matrixFilter != "" {
+		filters := parseMatrixFilter(*matrixFilter)
+		var filtered []*scenario.Scenario
+		for _, s := range scenarios {
+			if matchesMatrixFilter(s.Name, filters) {
+				filtered = append(filtered, s)
+			}
+		}
+		scenarios = filtered
+	}
+
 	if len(scenarios) == 0 {
 		fatalf("no matching scenarios found")
 	}
+
+	// Sort by weight descending so heavy/slow tests start first.
+	sort.Slice(scenarios, func(i, j int) bool {
+		return scenarios[i].Weight > scenarios[j].Weight
+	})
 
 	// Set up signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -206,16 +226,47 @@ func cmdRun(args []string) {
 }
 
 func cmdDebug(args []string) {
-	if len(args) == 0 {
-		fatalf("usage: drydock debug <scenario-path>")
+	fs := flag.NewFlagSet("debug", flag.ExitOnError)
+	matrixFilter := fs.String("matrix", "", "select matrix variant (e.g. database=postgres)")
+	_ = fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fatalf("usage: drydock debug [--matrix <key=val>] <scenario-path>")
 	}
 
 	requireDocker()
 
-	s, err := scenario.Load(args[0])
+	s, err := scenario.Load(fs.Arg(0))
 	if err != nil {
 		fatalf("loading scenario: %v", err)
 	}
+
+	// Resolve layers and expand matrix.
+	resolved, err := scenario.ResolveLayersAndMatrix(s, nil)
+	if err != nil {
+		fatalf("resolving layers: %v", err)
+	}
+
+	// If matrix produced multiple variants, filter or pick the first.
+	if len(resolved) > 1 && *matrixFilter != "" {
+		filters := parseMatrixFilter(*matrixFilter)
+		var filtered []*scenario.Scenario
+		for _, r := range resolved {
+			if matchesMatrixFilter(r.Name, filters) {
+				filtered = append(filtered, r)
+			}
+		}
+		if len(filtered) == 0 {
+			fatalf("no matrix variant matches filter %q", *matrixFilter)
+		}
+		resolved = filtered
+	}
+	if len(resolved) > 1 {
+		fmt.Fprintf(os.Stderr, "drydock: %d matrix variants available, using first: %s\n", len(resolved), resolved[0].Name)
+		fmt.Fprintf(os.Stderr, "  use --matrix to select a specific variant\n")
+	}
+	s = resolved[0]
+
 	if err := s.Validate(); err != nil {
 		fatalf("validation failed: %v", err)
 	}
@@ -306,21 +357,31 @@ func loadScenarios(path string) []*scenario.Scenario {
 		fatalf("path not found: %s", path)
 	}
 
-	var scenarios []*scenario.Scenario
+	var raw []*scenario.Scenario
 	if info.IsDir() {
-		scenarios, err = scenario.LoadDir(path)
+		raw, err = scenario.LoadDir(path)
 	} else {
 		var s *scenario.Scenario
 		s, err = scenario.Load(path)
 		if err == nil {
-			scenarios = []*scenario.Scenario{s}
+			raw = []*scenario.Scenario{s}
 		}
 	}
 	if err != nil {
 		fatalf("loading scenarios: %v", err)
 	}
-	if len(scenarios) == 0 {
+	if len(raw) == 0 {
 		fatalf("no scenarios found at %s", path)
+	}
+
+	// Resolve layers and expand matrix variants.
+	var scenarios []*scenario.Scenario
+	for _, s := range raw {
+		resolved, err := scenario.ResolveLayersAndMatrix(s, nil)
+		if err != nil {
+			fatalf("resolving layers for %q: %v", s.Name, err)
+		}
+		scenarios = append(scenarios, resolved...)
 	}
 	return scenarios
 }
@@ -336,4 +397,27 @@ func matchesTags(scenarioTags, filterTags []string) bool {
 		}
 	}
 	return false
+}
+
+// parseMatrixFilter parses "database=postgres,cache=redis" into a map.
+func parseMatrixFilter(s string) map[string]string {
+	filters := make(map[string]string)
+	for _, part := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) == 2 {
+			filters[kv[0]] = kv[1]
+		}
+	}
+	return filters
+}
+
+// matchesMatrixFilter checks if a scenario name contains all matrix filter
+// values. Matrix-expanded scenarios are named like "base-postgres-redis".
+func matchesMatrixFilter(name string, filters map[string]string) bool {
+	for _, v := range filters {
+		if !strings.Contains(name, v) {
+			return false
+		}
+	}
+	return true
 }
