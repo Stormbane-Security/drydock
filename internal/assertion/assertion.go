@@ -42,6 +42,8 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkFile(a, baseDir)
 		case "beacon":
 			result = checkBeacon(ctx, a, baseDir, env)
+		case "beacon_output":
+			result = checkBeaconOutput(a, baseDir)
 		case "classify":
 			result = checkClassify(ctx, a, baseDir, env)
 		case "github-run":
@@ -162,6 +164,14 @@ func checkCommand(ctx context.Context, a scenario.Assertion, baseDir string, env
 		return result
 	}
 
+	// Per-assertion timeout: default 60s, overridable via expect.timeout.
+	assertTimeout := 60 * time.Second
+	if a.Expect.Timeout.Duration > 0 {
+		assertTimeout = a.Expect.Timeout.Duration
+	}
+	ctx, cancel := context.WithTimeout(ctx, assertTimeout)
+	defer cancel()
+
 	r := runner.Run(ctx, a.Name, a.Expect.Command, baseDir, env)
 
 	expectedExit := 0
@@ -274,12 +284,39 @@ func checkFile(a scenario.Assertion, baseDir string) artifact.AssertionResult {
 // ── Beacon assertion ─────────────────────────────────────────────────────
 
 // beaconFinding matches the JSON output structure of beacon scan --format json.
+// Beacon wraps findings as {"finding": {check_id, ...}, "explanation": ...}.
+// Severity is int in beacon (not string), so we use json.RawMessage.
 type beaconFinding struct {
-	CheckID  string         `json:"check_id"`
-	Severity string         `json:"severity"`
-	Title    string         `json:"title"`
-	Asset    string         `json:"asset"`
-	Evidence map[string]any `json:"evidence"`
+	CheckID  string          `json:"check_id"`
+	Severity json.RawMessage `json:"severity"`
+	Title    string          `json:"title"`
+	Asset    string          `json:"asset"`
+	Evidence map[string]any  `json:"evidence"`
+}
+
+// severityString returns the severity as a comparable string.
+func (f beaconFinding) severityString() string {
+	s := strings.Trim(string(f.Severity), `"`)
+	// Map numeric severity values to names.
+	switch s {
+	case "0":
+		return "info"
+	case "1":
+		return "low"
+	case "2":
+		return "medium"
+	case "3":
+		return "high"
+	case "4":
+		return "critical"
+	default:
+		return s
+	}
+}
+
+// beaconEnrichedFinding matches the enriched wrapper that beacon emits.
+type beaconEnrichedFinding struct {
+	Finding beaconFinding `json:"finding"`
 }
 
 func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
@@ -292,90 +329,86 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	// Run beacon scan with proper argument separation (no shell injection).
-	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--skip-enrichment"}
+	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
-	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, env)
+	// Set BEACON_AUTHORIZED_ACK=1 to skip interactive confirmation in authorized mode.
+	// Drydock tests run against sandboxed infrastructure we own.
+	beaconEnv := make(map[string]string)
+	for k, v := range env {
+		beaconEnv[k] = v
+	}
+	beaconEnv["BEACON_AUTHORIZED_ACK"] = "1"
+	// Ensure $GOPATH/bin is on PATH so go-installed binaries are found.
+	// Append to existing PATH (which may already include test overrides) rather
+	// than replacing it.
+	existingPath := beaconEnv["PATH"]
+	if existingPath == "" {
+		existingPath = os.Getenv("PATH")
+	}
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		beaconEnv["PATH"] = existingPath + ":" + filepath.Join(gopath, "bin")
+	} else if home := os.Getenv("HOME"); home != "" {
+		beaconEnv["PATH"] = existingPath + ":" + filepath.Join(home, "go", "bin")
+	} else {
+		beaconEnv["PATH"] = existingPath
+	}
+	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, beaconEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result
 	}
 
 	// Parse findings from JSON output.
+	// Beacon outputs: {"findings": [{"finding": {"check_id": ...}, "explanation": ...}]}
 	var findings []beaconFinding
 	if err := json.Unmarshal([]byte(r.Stdout), &findings); err != nil {
-		// Try parsing as a wrapper object with a "findings" key.
-		var wrapper struct {
-			Findings []beaconFinding `json:"findings"`
+		// Try enriched wrapper: {"findings": [{"finding": {...}}]}
+		var enrichedWrapper struct {
+			Findings []beaconEnrichedFinding `json:"findings"`
 		}
-		if err2 := json.Unmarshal([]byte(r.Stdout), &wrapper); err2 != nil {
-			result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
-			return result
-		}
-		findings = wrapper.Findings
-	}
-
-	// Check min/max finding counts.
-	if a.Expect.MinFindings != nil && len(findings) < *a.Expect.MinFindings {
-		result.Message = fmt.Sprintf("expected at least %d findings, got %d", *a.Expect.MinFindings, len(findings))
-		return result
-	}
-	if a.Expect.MaxFindings != nil && len(findings) > *a.Expect.MaxFindings {
-		result.Message = fmt.Sprintf("expected at most %d findings, got %d", *a.Expect.MaxFindings, len(findings))
-		return result
-	}
-
-	// Check that a specific check_id is present.
-	if a.Expect.CheckID != "" {
-		found := false
-		for _, f := range findings {
-			if f.CheckID == a.Expect.CheckID {
-				found = true
-				// If severity is also specified, verify it matches.
-				if a.Expect.Severity != "" && f.Severity != a.Expect.Severity {
-					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.Severity, a.Expect.Severity)
-					return result
-				}
-				// If evidence key/value is specified, verify it.
-				if a.Expect.EvidenceKey != "" {
-					ev, ok := f.Evidence[a.Expect.EvidenceKey]
-					if !ok {
-						result.Message = fmt.Sprintf("finding %s missing evidence key %q", a.Expect.CheckID, a.Expect.EvidenceKey)
-						return result
-					}
-					if a.Expect.EvidenceValue != "" {
-						evStr := fmt.Sprintf("%v", ev)
-						if evStr != a.Expect.EvidenceValue {
-							result.Message = fmt.Sprintf("finding %s evidence %s=%q, expected %q", a.Expect.CheckID, a.Expect.EvidenceKey, evStr, a.Expect.EvidenceValue)
-							return result
-						}
-					}
-				}
-				break
+		if err2 := json.Unmarshal([]byte(r.Stdout), &enrichedWrapper); err2 == nil &&
+			len(enrichedWrapper.Findings) > 0 && enrichedWrapper.Findings[0].Finding.CheckID != "" {
+			for _, ef := range enrichedWrapper.Findings {
+				findings = append(findings, ef.Finding)
 			}
-		}
-		if !found {
-			var foundIDs []string
-			for _, f := range findings {
-				foundIDs = append(foundIDs, f.CheckID)
+		} else {
+			// Try flat wrapper: {"findings": [{"check_id": ...}]}
+			var flatWrapper struct {
+				Findings []beaconFinding `json:"findings"`
 			}
-			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: %v", a.Expect.CheckID, len(findings), foundIDs)
-			return result
-		}
-	}
-
-	// Check that a specific check_id is NOT present.
-	if a.Expect.NotCheckID != "" {
-		for _, f := range findings {
-			if f.CheckID == a.Expect.NotCheckID {
-				result.Message = fmt.Sprintf("finding %s should not be present but was found: %s", a.Expect.NotCheckID, f.Title)
+			if err3 := json.Unmarshal([]byte(r.Stdout), &flatWrapper); err3 != nil {
+				result.Message = fmt.Sprintf("failed to parse beacon output: %v\nraw output: %.500s", err, r.Stdout)
 				return result
 			}
+			findings = flatWrapper.Findings
+		}
+	}
+
+	// Build the list of expectations to check.
+	// If Expectations (list form) is set, use it. Otherwise wrap the single Expect.
+	expectations := a.Expectations
+	if len(expectations) == 0 {
+		expectations = []scenario.AssertionExpect{a.Expect}
+	}
+
+	// Check each expectation against the findings.
+	for i, expect := range expectations {
+		label := ""
+		if len(expectations) > 1 {
+			label = fmt.Sprintf("[%d] ", i+1)
+		}
+
+		if err := checkBeaconExpectation(expect, findings, label); err != "" {
+			result.Message = err
+			return result
 		}
 	}
 
 	result.Passed = true
 	detail := fmt.Sprintf("beacon scan completed: %d findings", len(findings))
-	if a.Expect.CheckID != "" {
+	if len(expectations) > 1 {
+		detail += fmt.Sprintf(", all %d expectations met", len(expectations))
+	} else if a.Expect.CheckID != "" {
 		detail += fmt.Sprintf(", %s present", a.Expect.CheckID)
 	}
 	if a.Expect.NotCheckID != "" {
@@ -383,6 +416,145 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 	result.Message = detail
 	return result
+}
+
+// checkBeaconOutput reads a beacon JSON output file and checks for expected findings.
+func checkBeaconOutput(a scenario.Assertion, baseDir string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+
+	if a.File == "" {
+		result.Message = "file is required for beacon_output assertions"
+		return result
+	}
+
+	filePath := a.File
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(baseDir, filePath)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		result.Message = fmt.Sprintf("failed to read beacon output file %s: %v", a.File, err)
+		return result
+	}
+
+	// Parse findings — same parsing logic as checkBeacon.
+	var findings []beaconFinding
+	if err := json.Unmarshal(data, &findings); err != nil {
+		var enrichedWrapper struct {
+			Findings []beaconEnrichedFinding `json:"findings"`
+		}
+		if err2 := json.Unmarshal(data, &enrichedWrapper); err2 == nil &&
+			len(enrichedWrapper.Findings) > 0 && enrichedWrapper.Findings[0].Finding.CheckID != "" {
+			for _, ef := range enrichedWrapper.Findings {
+				findings = append(findings, ef.Finding)
+			}
+		} else {
+			var flatWrapper struct {
+				Findings []beaconFinding `json:"findings"`
+			}
+			if err3 := json.Unmarshal(data, &flatWrapper); err3 != nil {
+				result.Message = fmt.Sprintf("failed to parse beacon output: %v", err)
+				return result
+			}
+			findings = flatWrapper.Findings
+		}
+	}
+
+	expectations := a.Expectations
+	if len(expectations) == 0 {
+		expectations = []scenario.AssertionExpect{a.Expect}
+	}
+
+	for i, expect := range expectations {
+		label := ""
+		if len(expectations) > 1 {
+			label = fmt.Sprintf("[%d] ", i+1)
+		}
+		if errMsg := checkBeaconExpectation(expect, findings, label); errMsg != "" {
+			result.Message = errMsg
+			return result
+		}
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("beacon output file: %d findings checked", len(findings))
+	return result
+}
+
+// checkBeaconExpectation checks a single expectation against a set of findings.
+// Returns an error message string, or empty string on success.
+func checkBeaconExpectation(expect scenario.AssertionExpect, findings []beaconFinding, label string) string {
+	// Check min/max finding counts.
+	if expect.MinFindings != nil && len(findings) < *expect.MinFindings {
+		return fmt.Sprintf("%sexpected at least %d findings, got %d", label, *expect.MinFindings, len(findings))
+	}
+	if expect.MaxFindings != nil && len(findings) > *expect.MaxFindings {
+		return fmt.Sprintf("%sexpected at most %d findings, got %d", label, *expect.MaxFindings, len(findings))
+	}
+
+	// Check that a specific check_id is present.
+	if expect.CheckID != "" {
+		found := false
+		for _, f := range findings {
+			if f.CheckID != expect.CheckID {
+				continue
+			}
+			// If severity is also specified, verify it matches.
+			if expect.Severity != "" && f.severityString() != expect.Severity {
+				return fmt.Sprintf("%sfinding %s has severity %q, expected %q", label, expect.CheckID, f.severityString(), expect.Severity)
+			}
+			// If evidence key/value is specified, verify it.
+			if expect.EvidenceKey != "" {
+				ev, ok := f.Evidence[expect.EvidenceKey]
+				if !ok {
+					// This finding matches the check_id but not the evidence key.
+					// Keep looking for another finding with the same check_id.
+					continue
+				}
+				if expect.EvidenceValue != "" {
+					evStr := fmt.Sprintf("%v", ev)
+					if evStr != expect.EvidenceValue {
+						continue
+					}
+				}
+			}
+			if expect.EvidenceContains != "" {
+				evJSON, _ := json.Marshal(f.Evidence)
+				if !strings.Contains(string(evJSON), expect.EvidenceContains) {
+					continue
+				}
+			}
+			found = true
+			break
+		}
+		if !found {
+			var foundIDs []string
+			for _, f := range findings {
+				foundIDs = append(foundIDs, f.CheckID)
+			}
+			detail := fmt.Sprintf("%sexpected finding %s", label, expect.CheckID)
+			if expect.EvidenceKey != "" {
+				detail += fmt.Sprintf(" with %s", expect.EvidenceKey)
+				if expect.EvidenceValue != "" {
+					detail += fmt.Sprintf("=%s", expect.EvidenceValue)
+				}
+			}
+			detail += fmt.Sprintf(" not found; got %d findings: %v", len(findings), foundIDs)
+			return detail
+		}
+	}
+
+	// Check that a specific check_id is NOT present.
+	if expect.NotCheckID != "" {
+		for _, f := range findings {
+			if f.CheckID == expect.NotCheckID {
+				return fmt.Sprintf("%sfinding %s should not be present but was found: %s", label, expect.NotCheckID, f.Title)
+			}
+		}
+	}
+
+	return ""
 }
 
 // ── Classify assertion ────────────────────────────────────────────────────
@@ -417,7 +589,16 @@ func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, en
 
 	// Run beacon classify with proper argument separation (no shell injection).
 	argv := []string{"beacon", "classify", a.Target, "--format", "json"}
-	r := runner.RunExec(ctx, "beacon-classify", argv, baseDir, env)
+	classifyEnv := make(map[string]string)
+	for k, v := range env {
+		classifyEnv[k] = v
+	}
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		classifyEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(gopath, "bin")
+	} else if home := os.Getenv("HOME"); home != "" {
+		classifyEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(home, "go", "bin")
+	}
+	r := runner.RunExec(ctx, "beacon-classify", argv, baseDir, classifyEnv)
 	if r.ExitCode != 0 && r.Stdout == "" {
 		result.Message = fmt.Sprintf("beacon classify failed (exit %d): %s", r.ExitCode, r.Stderr)
 		return result

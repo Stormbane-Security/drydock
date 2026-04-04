@@ -40,7 +40,7 @@ func TestGenerateComposeBytes_MultipleServicesWithDependsOn(t *testing.T) {
 		"web": {
 			Image:     "nginx:alpine",
 			Ports:     []string{"8080:80"},
-			DependsOn: []string{"db"},
+			DependsOn: DependsOn{Entries: []DependsOnEntry{{Service: "db"}}},
 		},
 		"db": {
 			Image: "postgres:16",
@@ -65,8 +65,8 @@ func TestGenerateComposeBytes_MultipleServicesWithDependsOn(t *testing.T) {
 	}
 
 	web := parsed.Services["web"]
-	if len(web.DependsOn) != 1 || web.DependsOn[0] != "db" {
-		t.Errorf("expected depends_on ['db'], got %v", web.DependsOn)
+	if len(web.DependsOn.Entries) != 1 || web.DependsOn.Entries[0].Service != "db" {
+		t.Errorf("expected depends_on ['db'], got %v", web.DependsOn.Entries)
 	}
 
 	db := parsed.Services["db"]
@@ -87,7 +87,7 @@ func TestGenerateComposeBytes_AllFields(t *testing.T) {
 			Ports:       []string{"3000:3000", "3001:3001"},
 			Environment: map[string]string{"NODE_ENV": "test"},
 			Volumes:     []string{"./data:/data"},
-			DependsOn:   []string{"db", "cache"},
+			DependsOn:   DependsOn{Entries: []DependsOnEntry{{Service: "db"}, {Service: "cache"}}},
 			Command:     "npm start",
 			Entrypoint:  "/entrypoint.sh",
 			HealthCheck: &ComposeHealth{
@@ -99,7 +99,7 @@ func TestGenerateComposeBytes_AllFields(t *testing.T) {
 			},
 			CapAdd:      []string{"NET_ADMIN", "SYS_PTRACE"},
 			SecurityOpt: []string{"seccomp:unconfined"},
-			Networks:    []string{"frontend"},
+			Networks:    map[string]ComposeServiceNetwork{"frontend": {}},
 			Restart:     "unless-stopped",
 		},
 	}
@@ -139,8 +139,8 @@ func TestGenerateComposeBytes_AllFields(t *testing.T) {
 	if len(app.Volumes) != 1 || app.Volumes[0] != "./data:/data" {
 		t.Errorf("volumes: got %v", app.Volumes)
 	}
-	if len(app.DependsOn) != 2 {
-		t.Errorf("expected 2 depends_on, got %d", len(app.DependsOn))
+	if len(app.DependsOn.Entries) != 2 {
+		t.Errorf("expected 2 depends_on, got %d", len(app.DependsOn.Entries))
 	}
 	if app.Restart != "unless-stopped" {
 		t.Errorf("restart: got %q", app.Restart)
@@ -184,7 +184,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 		"web": {Image: "nginx:alpine"},
 	}
 
-	path, err := GenerateComposeFile(services)
+	path, _, err := GenerateComposeFile(services, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("GenerateComposeFile: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestGenerateComposeFile_CreatesFile(t *testing.T) {
 }
 
 func TestGenerateComposeFile_EmptyServices(t *testing.T) {
-	_, err := GenerateComposeFile(map[string]ComposeService{})
+	_, _, err := GenerateComposeFile(map[string]ComposeService{}, t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("expected error for empty services")
 	}
@@ -293,6 +293,150 @@ func TestGenerateComposeBytes_CommandSlice(t *testing.T) {
 	}
 	if parsed.Services["app"].Image != "node:20" {
 		t.Errorf("expected image 'node:20', got %q", parsed.Services["app"].Image)
+	}
+}
+
+func TestDependsOn_MapForm(t *testing.T) {
+	yamlInput := `
+services:
+  web:
+    image: nginx:alpine
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7
+`
+	var s struct {
+		Services map[string]ComposeService `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(yamlInput), &s); err != nil {
+		t.Fatalf("unmarshal map-form depends_on: %v", err)
+	}
+
+	web := s.Services["web"]
+	if len(web.DependsOn.Entries) != 2 {
+		t.Fatalf("expected 2 depends_on entries, got %d", len(web.DependsOn.Entries))
+	}
+
+	// Verify entries contain the right services and conditions.
+	found := make(map[string]string)
+	for _, e := range web.DependsOn.Entries {
+		found[e.Service] = e.Condition
+	}
+	if found["db"] != "service_healthy" {
+		t.Errorf("expected db condition 'service_healthy', got %q", found["db"])
+	}
+	if found["cache"] != "service_started" {
+		t.Errorf("expected cache condition 'service_started', got %q", found["cache"])
+	}
+
+	// Round-trip: marshal and verify it produces map form (since conditions are present).
+	data, err := GenerateComposeBytes(s.Services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "condition:") {
+		t.Errorf("expected map-form depends_on with conditions in output, got:\n%s", content)
+	}
+}
+
+func TestDependsOn_ListForm(t *testing.T) {
+	yamlInput := `
+services:
+  web:
+    image: nginx:alpine
+    depends_on: [db, cache]
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7
+`
+	var s struct {
+		Services map[string]ComposeService `yaml:"services"`
+	}
+	if err := yaml.Unmarshal([]byte(yamlInput), &s); err != nil {
+		t.Fatalf("unmarshal list-form depends_on: %v", err)
+	}
+
+	web := s.Services["web"]
+	names := web.DependsOn.ServiceNames()
+	if len(names) != 2 {
+		t.Fatalf("expected 2 service names, got %d", len(names))
+	}
+
+	// Round-trip: marshal and verify it produces list form (no conditions).
+	data, err := GenerateComposeBytes(s.Services)
+	if err != nil {
+		t.Fatalf("GenerateComposeBytes: %v", err)
+	}
+	content := string(data)
+	if strings.Contains(content, "condition:") {
+		t.Errorf("expected list-form depends_on without conditions, got:\n%s", content)
+	}
+}
+
+func TestGenerateComposeFile_EphemeralPortsByDefault(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine", Ports: []string{"8080:80"}},
+		"db":  {Image: "postgres:16", Ports: []string{"5432:5432"}},
+	}
+
+	path, plan, err := GenerateComposeFile(services, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Port plan should record intended ports.
+	if len(plan.Mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(plan.Mappings))
+	}
+
+	// Generated file should have ephemeral (0:) ports.
+	data, _ := os.ReadFile(path)
+	content := string(data)
+	if !strings.Contains(content, "0:80") {
+		t.Errorf("expected ephemeral port 0:80 in output, got:\n%s", content)
+	}
+	if strings.Contains(content, "8080:80") {
+		t.Errorf("expected host port 8080 to be rewritten to ephemeral, got:\n%s", content)
+	}
+}
+
+func TestGenerateComposeFile_FixedPorts(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine", Ports: []string{"8080:80"}},
+		"db":  {Image: "postgres:16", Ports: []string{"5432:5432"}},
+	}
+
+	path, plan, err := GenerateComposeFile(services, t.TempDir(), nil, true)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Port plan should still record intended ports.
+	if len(plan.Mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(plan.Mappings))
+	}
+
+	// Generated file should preserve original ports.
+	data, _ := os.ReadFile(path)
+	content := string(data)
+	if !strings.Contains(content, "8080:80") {
+		t.Errorf("expected fixed port 8080:80 in output, got:\n%s", content)
+	}
+	if !strings.Contains(content, "5432:5432") {
+		t.Errorf("expected fixed port 5432:5432 in output, got:\n%s", content)
+	}
+	if strings.Contains(content, "- 0:80") || strings.Contains(content, "- \"0:80\"") {
+		t.Errorf("expected no ephemeral ports when fixed_ports=true, got:\n%s", content)
 	}
 }
 

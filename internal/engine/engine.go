@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/stormbane-security/drydock/internal/artifact"
@@ -135,6 +136,15 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 			record.Error = fmt.Sprintf("%s create failed: %v", b.Name(), err)
 			e.finalize(record)
 			return record, fmt.Errorf("%s create: %w", b.Name(), err)
+		}
+	}
+
+	// Phase 1b: Discover ephemeral ports and apply substitutions.
+	for _, b := range backends {
+		if cb, ok := b.(*compose.Backend); ok {
+			if err := e.resolveEphemeralPorts(ctx, cb, s); err != nil {
+				e.log("warning: ephemeral port resolution failed: %v", err)
+			}
 		}
 	}
 
@@ -320,15 +330,26 @@ func (e *Engine) ListRuns() ([]string, error) {
 func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error) {
 	// Unified format: generate compose.yaml from inline services.
 	if s.IsUnifiedFormat() {
-		composeFile, err := scenario.GenerateComposeFile(s.Services)
+		composeFile, portPlan, err := scenario.GenerateComposeFile(s.Services, s.Dir, s.Networks, s.FixedPorts)
 		if err != nil {
 			return nil, fmt.Errorf("generating compose file: %w", err)
 		}
 		dir := filepath.Dir(composeFile)
 		file := filepath.Base(composeFile)
-		return []backend.Backend{
-			compose.New(dir, file, "drydock-"+s.Name, s.Env),
-		}, nil
+		cb := compose.New(dir, file, "drydock-"+s.Name, s.Env)
+		// Attach port plan so we can query actual ports after Create.
+		if portPlan != nil {
+			var mappings []compose.PortMapping
+			for _, m := range portPlan.Mappings {
+				mappings = append(mappings, compose.PortMapping{
+					Service:       m.Service,
+					IntendedHost:  m.IntendedHost,
+					ContainerPort: m.ContainerPort,
+				})
+			}
+			cb.SetPortPlan(mappings)
+		}
+		return []backend.Backend{cb}, nil
 	}
 
 	// Old format: use backend configuration.
@@ -458,6 +479,15 @@ func (e *Engine) SetupDebug(ctx context.Context, s *scenario.Scenario) ([]backen
 		}
 	}
 
+	// Resolve ephemeral ports.
+	for _, b := range backends {
+		if cb, ok := b.(*compose.Backend); ok {
+			if err := e.resolveEphemeralPorts(ctx, cb, s); err != nil {
+				e.log("warning: ephemeral port resolution failed: %v", err)
+			}
+		}
+	}
+
 	// Wait for backend readiness.
 	e.log("waiting for environment readiness...")
 	for _, b := range backends {
@@ -502,6 +532,74 @@ func hostPort(mapping string) string {
 		}
 	}
 	return mapping
+}
+
+// resolveEphemeralPorts queries Docker for actual ephemeral port assignments
+// and substitutes them throughout the scenario's ready check, commands, and assertions.
+func (e *Engine) resolveEphemeralPorts(ctx context.Context, cb *compose.Backend, s *scenario.Scenario) error {
+	subs := cb.PortSubs()
+
+	// If no port plan was set, query using the stored plan.
+	if len(subs) == 0 {
+		plan := cb.GetPortPlan()
+		if len(plan) == 0 {
+			return nil
+		}
+		if err := cb.QueryPorts(ctx, plan); err != nil {
+			return err
+		}
+		subs = cb.PortSubs()
+	}
+
+	if len(subs) == 0 {
+		return nil
+	}
+
+	// Log the port mappings.
+	for intended, actual := range subs {
+		e.log("  port %s → %s", intended, actual)
+	}
+
+	// Apply substitutions to ready check.
+	if s.Ready != nil {
+		s.Ready.Cmd = substitutePort(s.Ready.Cmd, subs)
+	}
+
+	// Apply to commands.
+	for i := range s.Commands {
+		s.Commands[i].Run = substitutePort(s.Commands[i].Run, subs)
+	}
+	for i := range s.Run {
+		s.Run[i] = substitutePort(s.Run[i], subs)
+	}
+
+	// Apply to assertions.
+	for i := range s.Assertions {
+		s.Assertions[i].Target = substitutePort(s.Assertions[i].Target, subs)
+		if s.Assertions[i].Expect.Command != "" {
+			s.Assertions[i].Expect.Command = substitutePort(s.Assertions[i].Expect.Command, subs)
+		}
+		for j := range s.Assertions[i].Args {
+			s.Assertions[i].Args[j] = substitutePort(s.Assertions[i].Args[j], subs)
+		}
+	}
+
+	return nil
+}
+
+// substitutePort replaces all ":intendedPort" occurrences with ":actualPort"
+// in the given string.
+func substitutePort(s string, subs map[string]string) string {
+	for intended, actual := range subs {
+		if intended == actual {
+			continue
+		}
+		// Replace colon-separated ports (URLs, host:port).
+		s = strings.ReplaceAll(s, ":"+intended, ":"+actual)
+		// Replace space-separated ports (nc, netcat, nmap-style commands).
+		s = strings.ReplaceAll(s, " "+intended, " "+actual)
+	}
+	return s
 }
 
 func commandsToSpecs(commands []scenario.Command) []runner.CommandSpec {

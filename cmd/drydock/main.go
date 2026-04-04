@@ -17,14 +17,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/stormbane-security/drydock/internal/artifact"
 	"github.com/stormbane-security/drydock/internal/engine"
 	"github.com/stormbane-security/drydock/internal/scenario"
 )
@@ -81,8 +86,10 @@ Usage:
 
 Run flags:
   --tags <tag1,tag2>      Only run scenarios with matching tags
+  --matrix <k=v,...>      Filter matrix variants (e.g. database=postgres)
   --artifacts <dir>       Artifact output directory (default: .drydock/runs)
-  --json                  Output results as JSON`)
+  --json                  Output results as JSON
+  --ci                    CI mode: plain-text output, writes JUnit XML to artifacts dir`)
 }
 
 func fatalf(format string, args ...any) {
@@ -117,12 +124,15 @@ func requireDocker() {
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
+	matrixFilter := fs.String("matrix", "", "filter matrix variants (e.g. database=postgres,cache=redis)")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
+	fixedPorts := fs.Bool("fixed-ports", false, "use fixed host ports from YAML instead of random ephemeral ports")
+	ciMode := fs.Bool("ci", false, "CI mode: plain-text output, writes JUnit XML to artifacts dir")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fatalf("usage: drydock run [--tags <tags>] <scenario-path>")
+		fatalf("usage: drydock run [--tags <tags>] [--matrix <key=val,...>] <scenario-path>")
 	}
 
 	requireDocker()
@@ -141,8 +151,32 @@ func cmdRun(args []string) {
 		scenarios = filtered
 	}
 
+	// Filter by matrix values.
+	if *matrixFilter != "" {
+		filters := parseMatrixFilter(*matrixFilter)
+		var filtered []*scenario.Scenario
+		for _, s := range scenarios {
+			if matchesMatrixFilter(s.Name, filters) {
+				filtered = append(filtered, s)
+			}
+		}
+		scenarios = filtered
+	}
+
 	if len(scenarios) == 0 {
 		fatalf("no matching scenarios found")
+	}
+
+	// Sort by weight descending so heavy/slow tests start first.
+	sort.Slice(scenarios, func(i, j int) bool {
+		return scenarios[i].Weight > scenarios[j].Weight
+	})
+
+	// Apply --fixed-ports CLI override to all scenarios.
+	if *fixedPorts {
+		for _, s := range scenarios {
+			s.FixedPorts = true
+		}
 	}
 
 	// Set up signal handling for graceful shutdown.
@@ -167,14 +201,20 @@ func cmdRun(args []string) {
 
 	// Run scenarios.
 	var passed, failed, errored int
+	var records []*artifact.RunRecord
 	for _, s := range scenarios {
-		fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
+		if *ciMode {
+			fmt.Fprintf(os.Stderr, "--- RUN  %s\n", s.Name)
+		} else {
+			fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
+		}
 		record, err := eng.Run(ctx, s)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			errored++
 			continue
 		}
+		records = append(records, record)
 
 		if *jsonOutput {
 			data, _ := json.MarshalIndent(record, "", "  ")
@@ -184,38 +224,95 @@ func cmdRun(args []string) {
 		switch record.Status {
 		case "pass":
 			passed++
-			fmt.Fprintf(os.Stderr, "✓ %s PASSED (%.1fs)\n", s.Name, record.Duration.Seconds())
+			if *ciMode {
+				fmt.Fprintf(os.Stderr, "--- PASS %s (%.1fs)\n", s.Name, record.Duration.Seconds())
+			} else {
+				fmt.Fprintf(os.Stderr, "✓ %s PASSED (%.1fs)\n", s.Name, record.Duration.Seconds())
+			}
 		case "fail":
 			failed++
-			fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
-			for _, ar := range record.AssertionResults {
-				if !ar.Passed {
-					fmt.Fprintf(os.Stderr, "  FAIL: %s — %s\n", ar.Name, ar.Message)
+			if *ciMode {
+				fmt.Fprintf(os.Stderr, "--- FAIL %s: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+				for _, ar := range record.AssertionResults {
+					if !ar.Passed {
+						fmt.Fprintf(os.Stderr, "    %s: %s\n", ar.Name, ar.Message)
+					}
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+				for _, ar := range record.AssertionResults {
+					if !ar.Passed {
+						fmt.Fprintf(os.Stderr, "  FAIL: %s — %s\n", ar.Name, ar.Message)
+					}
 				}
 			}
 		default:
 			errored++
-			fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+			if *ciMode {
+				fmt.Fprintf(os.Stderr, "--- ERROR %s: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+			} else {
+				fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+			}
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "\n═══ Results: %d passed, %d failed, %d errors ═══\n", passed, failed, errored)
+	if *ciMode {
+		fmt.Fprintf(os.Stderr, "\nRESULTS: %d passed, %d failed, %d errors\n", passed, failed, errored)
+		writeJUnitXML(*artifactDir, records)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n═══ Results: %d passed, %d failed, %d errors ═══\n", passed, failed, errored)
+	}
 	if failed > 0 || errored > 0 {
 		os.Exit(1)
 	}
 }
 
 func cmdDebug(args []string) {
-	if len(args) == 0 {
-		fatalf("usage: drydock debug <scenario-path>")
+	fs := flag.NewFlagSet("debug", flag.ExitOnError)
+	matrixFilter := fs.String("matrix", "", "select matrix variant (e.g. database=postgres)")
+	fixedPorts := fs.Bool("fixed-ports", true, "use fixed host ports from YAML (default true for debug)")
+	_ = fs.Parse(args)
+
+	if fs.NArg() == 0 {
+		fatalf("usage: drydock debug [--matrix <key=val>] <scenario-path>")
 	}
 
 	requireDocker()
 
-	s, err := scenario.Load(args[0])
+	s, err := scenario.Load(fs.Arg(0))
 	if err != nil {
 		fatalf("loading scenario: %v", err)
 	}
+
+	// Resolve layers and expand matrix.
+	resolved, err := scenario.ResolveLayersAndMatrix(s, nil)
+	if err != nil {
+		fatalf("resolving layers: %v", err)
+	}
+
+	// If matrix produced multiple variants, filter or pick the first.
+	if len(resolved) > 1 && *matrixFilter != "" {
+		filters := parseMatrixFilter(*matrixFilter)
+		var filtered []*scenario.Scenario
+		for _, r := range resolved {
+			if matchesMatrixFilter(r.Name, filters) {
+				filtered = append(filtered, r)
+			}
+		}
+		if len(filtered) == 0 {
+			fatalf("no matrix variant matches filter %q", *matrixFilter)
+		}
+		resolved = filtered
+	}
+	if len(resolved) > 1 {
+		fmt.Fprintf(os.Stderr, "drydock: %d matrix variants available, using first: %s\n", len(resolved), resolved[0].Name)
+		fmt.Fprintf(os.Stderr, "  use --matrix to select a specific variant\n")
+	}
+	s = resolved[0]
+
+	// Apply --fixed-ports flag (defaults to true for debug mode).
+	s.FixedPorts = *fixedPorts
+
 	if err := s.Validate(); err != nil {
 		fatalf("validation failed: %v", err)
 	}
@@ -306,21 +403,31 @@ func loadScenarios(path string) []*scenario.Scenario {
 		fatalf("path not found: %s", path)
 	}
 
-	var scenarios []*scenario.Scenario
+	var raw []*scenario.Scenario
 	if info.IsDir() {
-		scenarios, err = scenario.LoadDir(path)
+		raw, err = scenario.LoadDir(path)
 	} else {
 		var s *scenario.Scenario
 		s, err = scenario.Load(path)
 		if err == nil {
-			scenarios = []*scenario.Scenario{s}
+			raw = []*scenario.Scenario{s}
 		}
 	}
 	if err != nil {
 		fatalf("loading scenarios: %v", err)
 	}
-	if len(scenarios) == 0 {
+	if len(raw) == 0 {
 		fatalf("no scenarios found at %s", path)
+	}
+
+	// Resolve layers and expand matrix variants.
+	var scenarios []*scenario.Scenario
+	for _, s := range raw {
+		resolved, err := scenario.ResolveLayersAndMatrix(s, nil)
+		if err != nil {
+			fatalf("resolving layers for %q: %v", s.Name, err)
+		}
+		scenarios = append(scenarios, resolved...)
 	}
 	return scenarios
 }
@@ -336,4 +443,121 @@ func matchesTags(scenarioTags, filterTags []string) bool {
 		}
 	}
 	return false
+}
+
+// parseMatrixFilter parses "database=postgres,cache=redis" into a map.
+func parseMatrixFilter(s string) map[string]string {
+	filters := make(map[string]string)
+	for _, part := range strings.Split(s, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) == 2 {
+			filters[kv[0]] = kv[1]
+		}
+	}
+	return filters
+}
+
+// matchesMatrixFilter checks if a scenario name contains all matrix filter
+// values. Matrix-expanded scenarios are named like "base-postgres-redis".
+func matchesMatrixFilter(name string, filters map[string]string) bool {
+	for _, v := range filters {
+		if !strings.Contains(name, v) {
+			return false
+		}
+	}
+	return true
+}
+
+// ── JUnit XML output for CI ──────────────────────────────────────────────────
+
+type junitTestSuites struct {
+	XMLName xml.Name         `xml:"testsuites"`
+	Suites  []junitTestSuite `xml:"testsuite"`
+}
+
+type junitTestSuite struct {
+	Name     string          `xml:"name,attr"`
+	Tests    int             `xml:"tests,attr"`
+	Failures int             `xml:"failures,attr"`
+	Errors   int             `xml:"errors,attr"`
+	Time     float64         `xml:"time,attr"`
+	Cases    []junitTestCase `xml:"testcase"`
+}
+
+type junitTestCase struct {
+	Name      string        `xml:"name,attr"`
+	Classname string        `xml:"classname,attr"`
+	Time      float64       `xml:"time,attr"`
+	Failure   *junitFailure `xml:"failure,omitempty"`
+	Error     *junitError   `xml:"error,omitempty"`
+}
+
+type junitFailure struct {
+	Message string `xml:"message,attr"`
+	Body    string `xml:",chardata"`
+}
+
+type junitError struct {
+	Message string `xml:"message,attr"`
+	Body    string `xml:",chardata"`
+}
+
+func writeJUnitXML(artifactDir string, records []*artifact.RunRecord) {
+	var totalTests, totalFail, totalErr int
+	var totalDur time.Duration
+	var cases []junitTestCase
+
+	for _, r := range records {
+		totalTests++
+		tc := junitTestCase{
+			Name:      r.Scenario,
+			Classname: "drydock",
+			Time:      r.Duration.Seconds(),
+		}
+		totalDur += r.Duration
+
+		switch r.Status {
+		case "fail":
+			totalFail++
+			var details []string
+			for _, ar := range r.AssertionResults {
+				if !ar.Passed {
+					details = append(details, ar.Name+": "+ar.Message)
+				}
+			}
+			tc.Failure = &junitFailure{
+				Message: r.Error,
+				Body:    strings.Join(details, "\n"),
+			}
+		case "error":
+			totalErr++
+			tc.Error = &junitError{Message: r.Error}
+		}
+		cases = append(cases, tc)
+	}
+
+	suites := junitTestSuites{
+		Suites: []junitTestSuite{{
+			Name:     "drydock",
+			Tests:    totalTests,
+			Failures: totalFail,
+			Errors:   totalErr,
+			Time:     totalDur.Seconds(),
+			Cases:    cases,
+		}},
+	}
+
+	data, err := xml.MarshalIndent(suites, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drydock: failed to generate JUnit XML: %v\n", err)
+		return
+	}
+
+	_ = os.MkdirAll(artifactDir, 0o750)
+	path := filepath.Join(artifactDir, "junit.xml")
+	if err := os.WriteFile(path, append([]byte(xml.Header), data...), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "drydock: failed to write %s: %v\n", path, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "JUnit XML: %s\n", path)
 }

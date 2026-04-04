@@ -12,6 +12,126 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DependsOn handles both Docker Compose depends_on formats:
+//
+//	List form:  depends_on: [db, cache]
+//	Map form:   depends_on: {db: {condition: service_healthy}}
+type DependsOn struct {
+	Entries []DependsOnEntry
+}
+
+// DependsOnEntry is a single service dependency with an optional condition.
+type DependsOnEntry struct {
+	Service   string
+	Condition string // e.g. "service_started", "service_healthy"
+}
+
+// ServiceNames returns just the service names.
+func (d DependsOn) ServiceNames() []string {
+	names := make([]string, len(d.Entries))
+	for i, e := range d.Entries {
+		names[i] = e.Service
+	}
+	return names
+}
+
+func (d *DependsOn) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		// List form: ["db", "cache"]
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		d.Entries = make([]DependsOnEntry, len(list))
+		for i, s := range list {
+			d.Entries[i] = DependsOnEntry{Service: s}
+		}
+		return nil
+	case yaml.MappingNode:
+		// Map form: {db: {condition: service_healthy}}
+		var m map[string]struct {
+			Condition string `yaml:"condition"`
+		}
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		d.Entries = make([]DependsOnEntry, 0, len(m))
+		for svc, cfg := range m {
+			d.Entries = append(d.Entries, DependsOnEntry{
+				Service:   svc,
+				Condition: cfg.Condition,
+			})
+		}
+		return nil
+	default:
+		return fmt.Errorf("depends_on must be a list or map, got %v", value.Kind)
+	}
+}
+
+func (d DependsOn) MarshalYAML() (any, error) {
+	if len(d.Entries) == 0 {
+		return nil, nil
+	}
+	// If any entry has a condition, marshal as map.
+	hasCondition := false
+	for _, e := range d.Entries {
+		if e.Condition != "" {
+			hasCondition = true
+			break
+		}
+	}
+	if !hasCondition {
+		return d.ServiceNames(), nil
+	}
+	m := make(map[string]map[string]string, len(d.Entries))
+	for _, e := range d.Entries {
+		if e.Condition != "" {
+			m[e.Service] = map[string]string{"condition": e.Condition}
+		} else {
+			m[e.Service] = map[string]string{"condition": "service_started"}
+		}
+	}
+	return m, nil
+}
+
+// IsEmpty returns true if there are no dependencies.
+func (d DependsOn) IsEmpty() bool {
+	return len(d.Entries) == 0
+}
+
+// Environment handles both Docker Compose environment formats:
+//
+//	Map form:  environment: {FOO: bar, BAZ: "1"}
+//	List form: environment: ["FOO=bar", "BAZ=1"]  or  - FOO=bar
+type Environment map[string]string
+
+func (e *Environment) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.MappingNode:
+		var m map[string]string
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		*e = m
+		return nil
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		m := make(map[string]string, len(list))
+		for _, item := range list {
+			k, v, _ := strings.Cut(item, "=")
+			m[k] = v
+		}
+		*e = m
+		return nil
+	default:
+		return fmt.Errorf("environment must be a map or list, got %v", value.Kind)
+	}
+}
+
 // Scenario is the top-level declarative test definition.
 type Scenario struct {
 	// Name identifies this scenario. Must be unique within a run.
@@ -60,11 +180,44 @@ type Scenario struct {
 	// Artifacts configures what to collect after the run.
 	Artifacts ArtifactConfig `yaml:"artifacts,omitempty"`
 
+	// Networks defines top-level Docker Compose networks with IPAM config.
+	Networks map[string]ComposeNetwork `yaml:"networks,omitempty"`
+
 	// Env injects environment variables into all commands and backends.
 	Env map[string]string `yaml:"env,omitempty"`
 
 	// Tags enable filtering scenarios by category.
 	Tags []string `yaml:"tags,omitempty"`
+
+	// Matrix defines parameterized variants for this scenario.
+	// Each key maps to a list of values. When matrix is set, the scenario
+	// is expanded into one run per combination. Services can reference
+	// matrix values via ${matrix.<key>} in their `from` field.
+	//
+	// Example:
+	//   matrix:
+	//     database: [postgres, mysql]
+	//   services:
+	//     db:
+	//       from: databases/${matrix.database}
+	//
+	// Run all: drydock run scenario.yaml
+	// Run one: drydock run scenario.yaml --matrix database=postgres
+	Matrix map[string][]string `yaml:"matrix,omitempty"`
+
+	// Weight is an optional scheduling hint. When multiple scenarios are queued,
+	// the runner sorts by descending weight so that heavy/slow tests (large images,
+	// long startup) begin first. Defaults to 0. Typical values: 10 (light),
+	// 50 (medium), 100 (heavy like GitLab/Confluence).
+	Weight int `yaml:"weight,omitempty"`
+
+	// FixedPorts preserves the host port numbers from the YAML instead of
+	// rewriting them to ephemeral (random) ports. Default is false — ports
+	// are randomized so tests prove service identification works by protocol
+	// fingerprinting, not port-number matching. Set to true when you need
+	// predictable ports (e.g. for drydock debug, manual testing, or services
+	// that advertise their own port in responses).
+	FixedPorts bool `yaml:"fixed_ports,omitempty"`
 
 	// Dir is the directory containing the scenario file (set by loader, not YAML).
 	Dir string `yaml:"-"`
@@ -79,19 +232,77 @@ func (s *Scenario) IsUnifiedFormat() bool {
 // ComposeService mirrors Docker Compose service configuration.
 // Fields are passed through to the generated compose.yaml as-is.
 type ComposeService struct {
+	// From loads a base service definition from a layer file.
+	// The path is relative to the layer search directories (e.g. "databases/postgres").
+	// Layer fields are used as defaults; any fields set on this service override them.
+	From        string            `yaml:"from,omitempty"`
+
 	Image       string            `yaml:"image,omitempty"`
 	Build       *ComposeBuild     `yaml:"build,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty"`
+	Environment Environment        `yaml:"environment,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
-	DependsOn   []string          `yaml:"depends_on,omitempty"`
+	DependsOn   DependsOn         `yaml:"depends_on,omitempty"`
 	Command     any               `yaml:"command,omitempty"`
 	Entrypoint  any               `yaml:"entrypoint,omitempty"`
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	SecurityOpt []string         `yaml:"security_opt,omitempty"`
-	Networks    []string          `yaml:"networks,omitempty"`
-	Restart     string            `yaml:"restart,omitempty"`
+	Privileged  bool             `yaml:"privileged,omitempty"`
+	Networks    ServiceNetworks `yaml:"networks,omitempty"`
+	Restart     string          `yaml:"restart,omitempty"`
+	Expose      []string        `yaml:"expose,omitempty"`
+}
+
+// ComposeServiceNetwork is the per-service network config (optional static IP).
+type ComposeServiceNetwork struct {
+	IPv4Address string `yaml:"ipv4_address,omitempty"`
+}
+
+// ServiceNetworks handles both Docker Compose per-service network formats:
+//
+//	List form: networks: [frontend, internal]
+//	Map form:  networks: {frontend: {ipv4_address: 10.0.0.2}}
+type ServiceNetworks map[string]ComposeServiceNetwork
+
+func (n *ServiceNetworks) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.MappingNode:
+		var m map[string]ComposeServiceNetwork
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		*n = m
+		return nil
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		m := make(map[string]ComposeServiceNetwork, len(list))
+		for _, name := range list {
+			m[name] = ComposeServiceNetwork{}
+		}
+		*n = m
+		return nil
+	default:
+		return fmt.Errorf("networks must be a map or list, got %v", value.Kind)
+	}
+}
+
+// ComposeNetwork defines a top-level Docker Compose network.
+type ComposeNetwork struct {
+	IPAM *ComposeIPAM `yaml:"ipam,omitempty"`
+}
+
+// ComposeIPAM configures IP address management for a network.
+type ComposeIPAM struct {
+	Config []ComposeIPAMConfig `yaml:"config,omitempty"`
+}
+
+// ComposeIPAMConfig is a single IPAM subnet configuration.
+type ComposeIPAMConfig struct {
+	Subnet string `yaml:"subnet,omitempty"`
 }
 
 // ComposeBuild mirrors the Docker Compose build configuration.
@@ -219,12 +430,14 @@ type Assertion struct {
 	Name string `yaml:"name"`
 
 	// Type selects the assertion engine.
-	//   "http"       — HTTP request to a URL, check status/body
-	//   "port"       — TCP port is open/closed
-	//   "command"    — Run a command, check exit code/output
-	//   "terraform"  — Check terraform output values
-	//   "file"       — Check file exists/contains
-	//   "beacon"     — Run beacon scan, check for findings
+	//   "http"           — HTTP request to a URL, check status/body
+	//   "port"           — TCP port is open/closed
+	//   "command"        — Run a command, check exit code/output
+	//   "terraform"      — Check terraform output values
+	//   "file"           — Check file exists/contains
+	//   "beacon"         — Run beacon scan, check for findings
+	//   "beacon_output"  — Read beacon JSON output file, check for findings
+	//   "classify"       — Run beacon classify, check asset classification
 	Type string `yaml:"type"`
 
 	// Target is assertion-type-specific (URL for http, host:port for port, etc.)
@@ -234,8 +447,18 @@ type Assertion struct {
 	// Currently used by the "beacon" assertion type (e.g. ["--scanners", "cors"]).
 	Args []string `yaml:"args,omitempty"`
 
-	// Expect defines the expected result.
+	// File is a path to a results file. Used by beacon_output to read
+	// pre-existing beacon JSON output instead of running a new scan.
+	File string `yaml:"file,omitempty"`
+
+	// Expect defines the expected result (single expectation).
 	Expect AssertionExpect `yaml:"expect"`
+
+	// Expectations defines multiple expected results checked against a single
+	// tool invocation. Used with beacon assertions to run one scan and verify
+	// multiple findings exist. If both Expect and Expectations are set,
+	// Expectations takes precedence for beacon assertions.
+	Expectations []AssertionExpect `yaml:"expectations,omitempty"`
 }
 
 // AssertionExpect defines expected outcomes for assertions.
@@ -251,10 +474,11 @@ type AssertionExpect struct {
 	Open   *bool `yaml:"open,omitempty"`
 
 	// Command assertions
-	Command  string `yaml:"command,omitempty"`
-	ExitCode *int   `yaml:"exit_code,omitempty"`
-	Stdout   string `yaml:"stdout,omitempty"`
-	NotStdout string `yaml:"not_stdout,omitempty"`
+	Command  string   `yaml:"command,omitempty"`
+	ExitCode *int     `yaml:"exit_code,omitempty"`
+	Stdout   string   `yaml:"stdout,omitempty"`
+	NotStdout string  `yaml:"not_stdout,omitempty"`
+	Timeout  Duration `yaml:"timeout,omitempty"` // per-assertion timeout (default 60s)
 
 	// Terraform assertions
 	Output      string `yaml:"output,omitempty"`       // terraform output name
@@ -271,8 +495,9 @@ type AssertionExpect struct {
 	Severity      string `yaml:"severity,omitempty"`        // expected severity (critical, high, medium, low, info)
 	MinFindings   *int   `yaml:"min_findings,omitempty"`    // minimum number of findings expected
 	MaxFindings   *int   `yaml:"max_findings,omitempty"`    // maximum number of findings expected
-	EvidenceKey   string `yaml:"evidence_key,omitempty"`    // key in evidence map to check
-	EvidenceValue string `yaml:"evidence_value,omitempty"`  // expected value for evidence key
+	EvidenceKey      string `yaml:"evidence_key,omitempty"`       // key in evidence map to check
+	EvidenceValue    string `yaml:"evidence_value,omitempty"`    // expected value for evidence key
+	EvidenceContains string `yaml:"evidence_contains,omitempty"` // substring match in serialized evidence
 
 	// GitHub Actions assertions
 	Conclusion   string `yaml:"conclusion,omitempty"`    // expected conclusion (success, failure, etc.)
@@ -377,6 +602,10 @@ func (s *Scenario) Validate() error {
 	if s.IsUnifiedFormat() {
 		// Validate services.
 		for name, svc := range s.Services {
+			// Services with from: get image/build from the layer after resolution.
+			if svc.From != "" {
+				continue
+			}
 			if svc.Image == "" && svc.Build == nil {
 				return fmt.Errorf("service %q must have either image or build", name)
 			}
@@ -435,8 +664,8 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file", "beacon", "classify",
-			"github-run", "github-job", "github-step", "github-artifact":
+		case "http", "port", "command", "terraform", "file", "beacon", "beacon_output",
+			"classify", "github-run", "github-job", "github-step", "github-artifact":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)
@@ -485,6 +714,11 @@ func LoadDir(dir string) ([]*Scenario, error) {
 			if yamlBases[entry.Name()] {
 				continue
 			}
+			// Skip "layers" directories — these contain reusable service
+			// fragments for "from:" references, not standalone scenarios.
+			if entry.Name() == "layers" {
+				continue
+			}
 			// Recurse into subdirectories to support nested layouts
 			// like tests/databases/redis.yaml.
 			sub, err := LoadDir(filepath.Join(dir, entry.Name()))
@@ -499,6 +733,11 @@ func LoadDir(dir string) ([]*Scenario, error) {
 			s, err := Load(filepath.Join(dir, name))
 			if err != nil {
 				return nil, err
+			}
+			// Skip non-scenario YAML files (layer defs, config fragments)
+			// that have no name field.
+			if s.Name == "" {
+				continue
 			}
 			scenarios = append(scenarios, s)
 		}
