@@ -122,6 +122,7 @@ func cmdRun(args []string) {
 	matrixFilter := fs.String("matrix", "", "filter matrix variants (e.g. database=postgres,cache=redis)")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
+	fixedPorts := fs.Bool("fixed-ports", false, "use fixed host ports from YAML instead of random ephemeral ports")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
@@ -164,6 +165,13 @@ func cmdRun(args []string) {
 	sort.Slice(scenarios, func(i, j int) bool {
 		return scenarios[i].Weight > scenarios[j].Weight
 	})
+
+	// Apply --fixed-ports CLI override to all scenarios.
+	if *fixedPorts {
+		for _, s := range scenarios {
+			s.FixedPorts = true
+		}
+	}
 
 	// Set up signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -228,6 +236,7 @@ func cmdRun(args []string) {
 func cmdDebug(args []string) {
 	fs := flag.NewFlagSet("debug", flag.ExitOnError)
 	matrixFilter := fs.String("matrix", "", "select matrix variant (e.g. database=postgres)")
+	fixedPorts := fs.Bool("fixed-ports", true, "use fixed host ports from YAML (default true for debug)")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
@@ -266,6 +275,9 @@ func cmdDebug(args []string) {
 		fmt.Fprintf(os.Stderr, "  use --matrix to select a specific variant\n")
 	}
 	s = resolved[0]
+
+	// Apply --fixed-ports flag (defaults to true for debug mode).
+	s.FixedPorts = *fixedPorts
 
 	if err := s.Validate(); err != nil {
 		fatalf("validation failed: %v", err)

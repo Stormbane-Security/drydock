@@ -179,6 +179,14 @@ type Scenario struct {
 	// 50 (medium), 100 (heavy like GitLab/Confluence).
 	Weight int `yaml:"weight,omitempty"`
 
+	// FixedPorts preserves the host port numbers from the YAML instead of
+	// rewriting them to ephemeral (random) ports. Default is false — ports
+	// are randomized so tests prove service identification works by protocol
+	// fingerprinting, not port-number matching. Set to true when you need
+	// predictable ports (e.g. for drydock debug, manual testing, or services
+	// that advertise their own port in responses).
+	FixedPorts bool `yaml:"fixed_ports,omitempty"`
+
 	// Dir is the directory containing the scenario file (set by loader, not YAML).
 	Dir string `yaml:"-"`
 }

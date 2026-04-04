@@ -381,6 +381,65 @@ services:
 	}
 }
 
+func TestGenerateComposeFile_EphemeralPortsByDefault(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine", Ports: []string{"8080:80"}},
+		"db":  {Image: "postgres:16", Ports: []string{"5432:5432"}},
+	}
+
+	path, plan, err := GenerateComposeFile(services, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Port plan should record intended ports.
+	if len(plan.Mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(plan.Mappings))
+	}
+
+	// Generated file should have ephemeral (0:) ports.
+	data, _ := os.ReadFile(path)
+	content := string(data)
+	if !strings.Contains(content, "0:80") {
+		t.Errorf("expected ephemeral port 0:80 in output, got:\n%s", content)
+	}
+	if strings.Contains(content, "8080:80") {
+		t.Errorf("expected host port 8080 to be rewritten to ephemeral, got:\n%s", content)
+	}
+}
+
+func TestGenerateComposeFile_FixedPorts(t *testing.T) {
+	services := map[string]ComposeService{
+		"web": {Image: "nginx:alpine", Ports: []string{"8080:80"}},
+		"db":  {Image: "postgres:16", Ports: []string{"5432:5432"}},
+	}
+
+	path, plan, err := GenerateComposeFile(services, t.TempDir(), nil, true)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Port plan should still record intended ports.
+	if len(plan.Mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(plan.Mappings))
+	}
+
+	// Generated file should preserve original ports.
+	data, _ := os.ReadFile(path)
+	content := string(data)
+	if !strings.Contains(content, "8080:80") {
+		t.Errorf("expected fixed port 8080:80 in output, got:\n%s", content)
+	}
+	if !strings.Contains(content, "5432:5432") {
+		t.Errorf("expected fixed port 5432:5432 in output, got:\n%s", content)
+	}
+	if strings.Contains(content, "- 0:80") || strings.Contains(content, "- \"0:80\"") {
+		t.Errorf("expected no ephemeral ports when fixed_ports=true, got:\n%s", content)
+	}
+}
+
 func TestGenerateComposeBytes_OmitsEmptyFields(t *testing.T) {
 	services := map[string]ComposeService{
 		"minimal": {Image: "alpine"},

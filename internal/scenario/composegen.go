@@ -63,10 +63,13 @@ func parsePortSpec(spec string) (host, container string) {
 
 // GenerateComposeFile marshals the services map into a valid Docker Compose v3
 // YAML file, writes it to a temp directory, and returns the file path and
-// port plan. All host ports are rewritten to ephemeral (0) to avoid conflicts.
+// port plan. When fixedPorts is false (default), host ports are rewritten to
+// ephemeral (0) so Docker assigns random ports — this forces tests to prove
+// service identification by protocol fingerprinting. When fixedPorts is true,
+// the original host ports from the YAML are preserved as-is.
 // Volume paths starting with "./" are resolved to absolute paths relative to baseDir.
 // The caller is responsible for removing the temp directory when done.
-func GenerateComposeFile(services map[string]ComposeService, baseDir string, networks map[string]ComposeNetwork) (string, *PortPlan, error) {
+func GenerateComposeFile(services map[string]ComposeService, baseDir string, networks map[string]ComposeNetwork, fixedPorts ...bool) (string, *PortPlan, error) {
 	if len(services) == 0 {
 		return "", nil, fmt.Errorf("no services defined")
 	}
@@ -77,9 +80,13 @@ func GenerateComposeFile(services map[string]ComposeService, baseDir string, net
 		Networks: networks,
 	}
 
+	useFixed := len(fixedPorts) > 0 && fixedPorts[0]
+
 	for name, svc := range services {
-		// Rewrite ports to use ephemeral host ports.
-		ephemeralPorts := make([]string, len(svc.Ports))
+		// Build port mappings. When useFixed is false (default), rewrite
+		// host ports to 0 so Docker assigns random ports. When useFixed is
+		// true, preserve the original host ports from the YAML.
+		outputPorts := make([]string, len(svc.Ports))
 		for i, p := range svc.Ports {
 			host, container := parsePortSpec(p)
 			plan.Mappings = append(plan.Mappings, PortMapping{
@@ -87,7 +94,11 @@ func GenerateComposeFile(services map[string]ComposeService, baseDir string, net
 				IntendedHost:  host,
 				ContainerPort: container,
 			})
-			ephemeralPorts[i] = "0:" + container
+			if useFixed {
+				outputPorts[i] = host + ":" + container
+			} else {
+				outputPorts[i] = "0:" + container
+			}
 		}
 
 		// Resolve relative volume paths to absolute paths.
@@ -109,7 +120,7 @@ func GenerateComposeFile(services map[string]ComposeService, baseDir string, net
 		out.Services[name] = composeServiceOut{
 			Image:       svc.Image,
 			Build:       resolvedBuild,
-			Ports:       ephemeralPorts,
+			Ports:       outputPorts,
 			Environment: svc.Environment,
 			Volumes:     resolvedVolumes,
 			DependsOn:   svc.DependsOn,
