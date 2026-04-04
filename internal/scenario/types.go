@@ -100,6 +100,38 @@ func (d DependsOn) IsEmpty() bool {
 	return len(d.Entries) == 0
 }
 
+// Environment handles both Docker Compose environment formats:
+//
+//	Map form:  environment: {FOO: bar, BAZ: "1"}
+//	List form: environment: ["FOO=bar", "BAZ=1"]  or  - FOO=bar
+type Environment map[string]string
+
+func (e *Environment) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.MappingNode:
+		var m map[string]string
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		*e = m
+		return nil
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		m := make(map[string]string, len(list))
+		for _, item := range list {
+			k, v, _ := strings.Cut(item, "=")
+			m[k] = v
+		}
+		*e = m
+		return nil
+	default:
+		return fmt.Errorf("environment must be a map or list, got %v", value.Kind)
+	}
+}
+
 // Scenario is the top-level declarative test definition.
 type Scenario struct {
 	// Name identifies this scenario. Must be unique within a run.
@@ -208,7 +240,7 @@ type ComposeService struct {
 	Image       string            `yaml:"image,omitempty"`
 	Build       *ComposeBuild     `yaml:"build,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
-	Environment map[string]string `yaml:"environment,omitempty"`
+	Environment Environment        `yaml:"environment,omitempty"`
 	Volumes     []string          `yaml:"volumes,omitempty"`
 	DependsOn   DependsOn         `yaml:"depends_on,omitempty"`
 	Command     any               `yaml:"command,omitempty"`
@@ -217,14 +249,45 @@ type ComposeService struct {
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	SecurityOpt []string         `yaml:"security_opt,omitempty"`
 	Privileged  bool             `yaml:"privileged,omitempty"`
-	Networks    map[string]ComposeServiceNetwork `yaml:"networks,omitempty"`
-	Restart     string                           `yaml:"restart,omitempty"`
-	Expose      []string         `yaml:"expose,omitempty"`
+	Networks    ServiceNetworks `yaml:"networks,omitempty"`
+	Restart     string          `yaml:"restart,omitempty"`
+	Expose      []string        `yaml:"expose,omitempty"`
 }
 
 // ComposeServiceNetwork is the per-service network config (optional static IP).
 type ComposeServiceNetwork struct {
 	IPv4Address string `yaml:"ipv4_address,omitempty"`
+}
+
+// ServiceNetworks handles both Docker Compose per-service network formats:
+//
+//	List form: networks: [frontend, internal]
+//	Map form:  networks: {frontend: {ipv4_address: 10.0.0.2}}
+type ServiceNetworks map[string]ComposeServiceNetwork
+
+func (n *ServiceNetworks) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.MappingNode:
+		var m map[string]ComposeServiceNetwork
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		*n = m
+		return nil
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		m := make(map[string]ComposeServiceNetwork, len(list))
+		for _, name := range list {
+			m[name] = ComposeServiceNetwork{}
+		}
+		*n = m
+		return nil
+	default:
+		return fmt.Errorf("networks must be a map or list, got %v", value.Kind)
+	}
 }
 
 // ComposeNetwork defines a top-level Docker Compose network.
@@ -367,12 +430,14 @@ type Assertion struct {
 	Name string `yaml:"name"`
 
 	// Type selects the assertion engine.
-	//   "http"       — HTTP request to a URL, check status/body
-	//   "port"       — TCP port is open/closed
-	//   "command"    — Run a command, check exit code/output
-	//   "terraform"  — Check terraform output values
-	//   "file"       — Check file exists/contains
-	//   "beacon"     — Run beacon scan, check for findings
+	//   "http"           — HTTP request to a URL, check status/body
+	//   "port"           — TCP port is open/closed
+	//   "command"        — Run a command, check exit code/output
+	//   "terraform"      — Check terraform output values
+	//   "file"           — Check file exists/contains
+	//   "beacon"         — Run beacon scan, check for findings
+	//   "beacon_output"  — Read beacon JSON output file, check for findings
+	//   "classify"       — Run beacon classify, check asset classification
 	Type string `yaml:"type"`
 
 	// Target is assertion-type-specific (URL for http, host:port for port, etc.)
@@ -381,6 +446,10 @@ type Assertion struct {
 	// Args are extra CLI arguments appended to the tool invocation.
 	// Currently used by the "beacon" assertion type (e.g. ["--scanners", "cors"]).
 	Args []string `yaml:"args,omitempty"`
+
+	// File is a path to a results file. Used by beacon_output to read
+	// pre-existing beacon JSON output instead of running a new scan.
+	File string `yaml:"file,omitempty"`
 
 	// Expect defines the expected result (single expectation).
 	Expect AssertionExpect `yaml:"expect"`
@@ -426,8 +495,9 @@ type AssertionExpect struct {
 	Severity      string `yaml:"severity,omitempty"`        // expected severity (critical, high, medium, low, info)
 	MinFindings   *int   `yaml:"min_findings,omitempty"`    // minimum number of findings expected
 	MaxFindings   *int   `yaml:"max_findings,omitempty"`    // maximum number of findings expected
-	EvidenceKey   string `yaml:"evidence_key,omitempty"`    // key in evidence map to check
-	EvidenceValue string `yaml:"evidence_value,omitempty"`  // expected value for evidence key
+	EvidenceKey      string `yaml:"evidence_key,omitempty"`       // key in evidence map to check
+	EvidenceValue    string `yaml:"evidence_value,omitempty"`    // expected value for evidence key
+	EvidenceContains string `yaml:"evidence_contains,omitempty"` // substring match in serialized evidence
 
 	// GitHub Actions assertions
 	Conclusion   string `yaml:"conclusion,omitempty"`    // expected conclusion (success, failure, etc.)
@@ -594,8 +664,8 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
-		case "http", "port", "command", "terraform", "file", "beacon", "classify",
-			"github-run", "github-job", "github-step", "github-artifact":
+		case "http", "port", "command", "terraform", "file", "beacon", "beacon_output",
+			"classify", "github-run", "github-job", "github-step", "github-artifact":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)
@@ -644,6 +714,11 @@ func LoadDir(dir string) ([]*Scenario, error) {
 			if yamlBases[entry.Name()] {
 				continue
 			}
+			// Skip "layers" directories — these contain reusable service
+			// fragments for "from:" references, not standalone scenarios.
+			if entry.Name() == "layers" {
+				continue
+			}
 			// Recurse into subdirectories to support nested layouts
 			// like tests/databases/redis.yaml.
 			sub, err := LoadDir(filepath.Join(dir, entry.Name()))
@@ -658,6 +733,11 @@ func LoadDir(dir string) ([]*Scenario, error) {
 			s, err := Load(filepath.Join(dir, name))
 			if err != nil {
 				return nil, err
+			}
+			// Skip non-scenario YAML files (layer defs, config fragments)
+			// that have no name field.
+			if s.Name == "" {
+				continue
 			}
 			scenarios = append(scenarios, s)
 		}

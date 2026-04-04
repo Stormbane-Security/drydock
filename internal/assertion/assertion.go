@@ -42,6 +42,8 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkFile(a, baseDir)
 		case "beacon":
 			result = checkBeacon(ctx, a, baseDir, env)
+		case "beacon_output":
+			result = checkBeaconOutput(a, baseDir)
 		case "classify":
 			result = checkClassify(ctx, a, baseDir, env)
 		case "github-run":
@@ -382,68 +384,31 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		}
 	}
 
-	// Check min/max finding counts.
-	if a.Expect.MinFindings != nil && len(findings) < *a.Expect.MinFindings {
-		result.Message = fmt.Sprintf("expected at least %d findings, got %d", *a.Expect.MinFindings, len(findings))
-		return result
-	}
-	if a.Expect.MaxFindings != nil && len(findings) > *a.Expect.MaxFindings {
-		result.Message = fmt.Sprintf("expected at most %d findings, got %d", *a.Expect.MaxFindings, len(findings))
-		return result
+	// Build the list of expectations to check.
+	// If Expectations (list form) is set, use it. Otherwise wrap the single Expect.
+	expectations := a.Expectations
+	if len(expectations) == 0 {
+		expectations = []scenario.AssertionExpect{a.Expect}
 	}
 
-	// Check that a specific check_id is present.
-	if a.Expect.CheckID != "" {
-		found := false
-		for _, f := range findings {
-			if f.CheckID == a.Expect.CheckID {
-				found = true
-				// If severity is also specified, verify it matches.
-				if a.Expect.Severity != "" && f.severityString() != a.Expect.Severity {
-					result.Message = fmt.Sprintf("finding %s has severity %q, expected %q", a.Expect.CheckID, f.severityString(), a.Expect.Severity)
-					return result
-				}
-				// If evidence key/value is specified, verify it.
-				if a.Expect.EvidenceKey != "" {
-					ev, ok := f.Evidence[a.Expect.EvidenceKey]
-					if !ok {
-						result.Message = fmt.Sprintf("finding %s missing evidence key %q", a.Expect.CheckID, a.Expect.EvidenceKey)
-						return result
-					}
-					if a.Expect.EvidenceValue != "" {
-						evStr := fmt.Sprintf("%v", ev)
-						if evStr != a.Expect.EvidenceValue {
-							result.Message = fmt.Sprintf("finding %s evidence %s=%q, expected %q", a.Expect.CheckID, a.Expect.EvidenceKey, evStr, a.Expect.EvidenceValue)
-							return result
-						}
-					}
-				}
-				break
-			}
+	// Check each expectation against the findings.
+	for i, expect := range expectations {
+		label := ""
+		if len(expectations) > 1 {
+			label = fmt.Sprintf("[%d] ", i+1)
 		}
-		if !found {
-			var foundIDs []string
-			for _, f := range findings {
-				foundIDs = append(foundIDs, f.CheckID)
-			}
-			result.Message = fmt.Sprintf("expected finding %s not found; got %d findings: %v", a.Expect.CheckID, len(findings), foundIDs)
+
+		if err := checkBeaconExpectation(expect, findings, label); err != "" {
+			result.Message = err
 			return result
-		}
-	}
-
-	// Check that a specific check_id is NOT present.
-	if a.Expect.NotCheckID != "" {
-		for _, f := range findings {
-			if f.CheckID == a.Expect.NotCheckID {
-				result.Message = fmt.Sprintf("finding %s should not be present but was found: %s", a.Expect.NotCheckID, f.Title)
-				return result
-			}
 		}
 	}
 
 	result.Passed = true
 	detail := fmt.Sprintf("beacon scan completed: %d findings", len(findings))
-	if a.Expect.CheckID != "" {
+	if len(expectations) > 1 {
+		detail += fmt.Sprintf(", all %d expectations met", len(expectations))
+	} else if a.Expect.CheckID != "" {
 		detail += fmt.Sprintf(", %s present", a.Expect.CheckID)
 	}
 	if a.Expect.NotCheckID != "" {
@@ -451,6 +416,145 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 	result.Message = detail
 	return result
+}
+
+// checkBeaconOutput reads a beacon JSON output file and checks for expected findings.
+func checkBeaconOutput(a scenario.Assertion, baseDir string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+
+	if a.File == "" {
+		result.Message = "file is required for beacon_output assertions"
+		return result
+	}
+
+	filePath := a.File
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(baseDir, filePath)
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		result.Message = fmt.Sprintf("failed to read beacon output file %s: %v", a.File, err)
+		return result
+	}
+
+	// Parse findings — same parsing logic as checkBeacon.
+	var findings []beaconFinding
+	if err := json.Unmarshal(data, &findings); err != nil {
+		var enrichedWrapper struct {
+			Findings []beaconEnrichedFinding `json:"findings"`
+		}
+		if err2 := json.Unmarshal(data, &enrichedWrapper); err2 == nil &&
+			len(enrichedWrapper.Findings) > 0 && enrichedWrapper.Findings[0].Finding.CheckID != "" {
+			for _, ef := range enrichedWrapper.Findings {
+				findings = append(findings, ef.Finding)
+			}
+		} else {
+			var flatWrapper struct {
+				Findings []beaconFinding `json:"findings"`
+			}
+			if err3 := json.Unmarshal(data, &flatWrapper); err3 != nil {
+				result.Message = fmt.Sprintf("failed to parse beacon output: %v", err)
+				return result
+			}
+			findings = flatWrapper.Findings
+		}
+	}
+
+	expectations := a.Expectations
+	if len(expectations) == 0 {
+		expectations = []scenario.AssertionExpect{a.Expect}
+	}
+
+	for i, expect := range expectations {
+		label := ""
+		if len(expectations) > 1 {
+			label = fmt.Sprintf("[%d] ", i+1)
+		}
+		if errMsg := checkBeaconExpectation(expect, findings, label); errMsg != "" {
+			result.Message = errMsg
+			return result
+		}
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("beacon output file: %d findings checked", len(findings))
+	return result
+}
+
+// checkBeaconExpectation checks a single expectation against a set of findings.
+// Returns an error message string, or empty string on success.
+func checkBeaconExpectation(expect scenario.AssertionExpect, findings []beaconFinding, label string) string {
+	// Check min/max finding counts.
+	if expect.MinFindings != nil && len(findings) < *expect.MinFindings {
+		return fmt.Sprintf("%sexpected at least %d findings, got %d", label, *expect.MinFindings, len(findings))
+	}
+	if expect.MaxFindings != nil && len(findings) > *expect.MaxFindings {
+		return fmt.Sprintf("%sexpected at most %d findings, got %d", label, *expect.MaxFindings, len(findings))
+	}
+
+	// Check that a specific check_id is present.
+	if expect.CheckID != "" {
+		found := false
+		for _, f := range findings {
+			if f.CheckID != expect.CheckID {
+				continue
+			}
+			// If severity is also specified, verify it matches.
+			if expect.Severity != "" && f.severityString() != expect.Severity {
+				return fmt.Sprintf("%sfinding %s has severity %q, expected %q", label, expect.CheckID, f.severityString(), expect.Severity)
+			}
+			// If evidence key/value is specified, verify it.
+			if expect.EvidenceKey != "" {
+				ev, ok := f.Evidence[expect.EvidenceKey]
+				if !ok {
+					// This finding matches the check_id but not the evidence key.
+					// Keep looking for another finding with the same check_id.
+					continue
+				}
+				if expect.EvidenceValue != "" {
+					evStr := fmt.Sprintf("%v", ev)
+					if evStr != expect.EvidenceValue {
+						continue
+					}
+				}
+			}
+			if expect.EvidenceContains != "" {
+				evJSON, _ := json.Marshal(f.Evidence)
+				if !strings.Contains(string(evJSON), expect.EvidenceContains) {
+					continue
+				}
+			}
+			found = true
+			break
+		}
+		if !found {
+			var foundIDs []string
+			for _, f := range findings {
+				foundIDs = append(foundIDs, f.CheckID)
+			}
+			detail := fmt.Sprintf("%sexpected finding %s", label, expect.CheckID)
+			if expect.EvidenceKey != "" {
+				detail += fmt.Sprintf(" with %s", expect.EvidenceKey)
+				if expect.EvidenceValue != "" {
+					detail += fmt.Sprintf("=%s", expect.EvidenceValue)
+				}
+			}
+			detail += fmt.Sprintf(" not found; got %d findings: %v", len(findings), foundIDs)
+			return detail
+		}
+	}
+
+	// Check that a specific check_id is NOT present.
+	if expect.NotCheckID != "" {
+		for _, f := range findings {
+			if f.CheckID == expect.NotCheckID {
+				return fmt.Sprintf("%sfinding %s should not be present but was found: %s", label, expect.NotCheckID, f.Title)
+			}
+		}
+	}
+
+	return ""
 }
 
 // ── Classify assertion ────────────────────────────────────────────────────
