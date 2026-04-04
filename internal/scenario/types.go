@@ -216,8 +216,10 @@ type ComposeService struct {
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
 	CapAdd      []string          `yaml:"cap_add,omitempty"`
 	SecurityOpt []string         `yaml:"security_opt,omitempty"`
+	Privileged  bool             `yaml:"privileged,omitempty"`
 	Networks    map[string]ComposeServiceNetwork `yaml:"networks,omitempty"`
 	Restart     string                           `yaml:"restart,omitempty"`
+	Expose      []string         `yaml:"expose,omitempty"`
 }
 
 // ComposeServiceNetwork is the per-service network config (optional static IP).

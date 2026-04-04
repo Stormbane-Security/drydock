@@ -31,8 +31,10 @@ type composeServiceOut struct {
 	HealthCheck *ComposeHealth    `yaml:"healthcheck,omitempty"`
 	CapAdd      []string                          `yaml:"cap_add,omitempty"`
 	SecurityOpt []string                         `yaml:"security_opt,omitempty"`
+	Privileged  bool                              `yaml:"privileged,omitempty"`
 	Networks    map[string]ComposeServiceNetwork  `yaml:"networks,omitempty"`
 	Restart     string                            `yaml:"restart,omitempty"`
+	Expose      []string                          `yaml:"expose,omitempty"`
 }
 
 // PortMapping records the intended host port for a container port on a service.
@@ -129,8 +131,10 @@ func GenerateComposeFile(services map[string]ComposeService, baseDir string, net
 			HealthCheck: svc.HealthCheck,
 			CapAdd:      svc.CapAdd,
 			SecurityOpt: svc.SecurityOpt,
+			Privileged:  svc.Privileged,
 			Networks:    svc.Networks,
 			Restart:     svc.Restart,
+			Expose:      svc.Expose,
 		}
 	}
 
@@ -210,8 +214,10 @@ func GenerateComposeBytes(services map[string]ComposeService) ([]byte, error) {
 			HealthCheck: svc.HealthCheck,
 			CapAdd:      svc.CapAdd,
 			SecurityOpt: svc.SecurityOpt,
+			Privileged:  svc.Privileged,
 			Networks:    svc.Networks,
 			Restart:     svc.Restart,
+			Expose:      svc.Expose,
 		}
 	}
 
