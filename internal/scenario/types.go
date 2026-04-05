@@ -516,7 +516,8 @@ type AssertionExpect struct {
 	IsReverseProxy  *bool  `yaml:"is_reverse_proxy,omitempty"`  // boolean match
 	HasDMARC        *bool  `yaml:"has_dmarc,omitempty"`          // boolean match
 	BackendService  string `yaml:"backend_service,omitempty"`   // value must appear in backend_services array
-	ServiceVersion  string `yaml:"service_version,omitempty"`   // key must exist in service_versions map
+	ServiceVersion         string `yaml:"service_version,omitempty"`          // key must exist in service_versions map
+	ServiceVersionContains string `yaml:"service_version_contains,omitempty"` // substring match on service_versions value for given key (format: "key:substring")
 	CookieName      string `yaml:"cookie_name,omitempty"`       // value must appear in cookie_names array
 	PathResponds    string `yaml:"path_responds,omitempty"`     // path must appear in responding_paths array
 	MatchedPlaybook string `yaml:"matched_playbook,omitempty"`  // playbook must appear in matched_playbooks array

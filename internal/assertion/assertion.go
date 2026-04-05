@@ -338,6 +338,13 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		beaconEnv[k] = v
 	}
 	beaconEnv["BEACON_AUTHORIZED_ACK"] = "1"
+	// Use a unique temp home per beacon invocation to avoid SQLite BUSY errors
+	// when multiple drydock tests run concurrently.
+	tmpHome, tmpErr := os.MkdirTemp("", "drydock-beacon-*")
+	if tmpErr == nil {
+		beaconEnv["HOME"] = tmpHome
+		defer os.RemoveAll(tmpHome)
+	}
 	// Ensure $GOPATH/bin is on PATH so go-installed binaries are found.
 	// Append to existing PATH (which may already include test overrides) rather
 	// than replacing it.
@@ -593,6 +600,11 @@ func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, en
 	for k, v := range env {
 		classifyEnv[k] = v
 	}
+	// Use a unique temp home to avoid SQLite BUSY when running concurrently.
+	if tmpHome, err := os.MkdirTemp("", "drydock-classify-*"); err == nil {
+		classifyEnv["HOME"] = tmpHome
+		defer os.RemoveAll(tmpHome)
+	}
 	if gopath := os.Getenv("GOPATH"); gopath != "" {
 		classifyEnv["PATH"] = os.Getenv("PATH") + ":" + filepath.Join(gopath, "bin")
 	} else if home := os.Getenv("HOME"); home != "" {
@@ -702,6 +714,26 @@ func checkClassify(ctx context.Context, a scenario.Assertion, baseDir string, en
 			ok:      exists,
 			message: fmt.Sprintf("service_version: key %q not found in service_versions", a.Expect.ServiceVersion),
 		})
+	}
+	if a.Expect.ServiceVersionContains != "" {
+		// Format: "key:substring" — e.g. "web_server:nginx/1.14"
+		parts := strings.SplitN(a.Expect.ServiceVersionContains, ":", 2)
+		if len(parts) == 2 {
+			key, substr := parts[0], parts[1]
+			val, exists := out.ServiceVersions[key]
+			matched := exists && strings.Contains(strings.ToLower(val), strings.ToLower(substr))
+			checks = append(checks, check{
+				field:   "service_version_contains",
+				ok:      matched,
+				message: fmt.Sprintf("service_version_contains: key %q value %q does not contain %q", key, val, substr),
+			})
+		} else {
+			checks = append(checks, check{
+				field:   "service_version_contains",
+				ok:      false,
+				message: fmt.Sprintf("service_version_contains: invalid format %q, expected 'key:substring'", a.Expect.ServiceVersionContains),
+			})
+		}
 	}
 	if a.Expect.CookieName != "" {
 		found := false
