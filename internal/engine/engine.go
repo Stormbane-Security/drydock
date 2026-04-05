@@ -588,7 +588,8 @@ func (e *Engine) resolveEphemeralPorts(ctx context.Context, cb *compose.Backend,
 }
 
 // substitutePort replaces all ":intendedPort" occurrences with ":actualPort"
-// in the given string.
+// in the given string. Also handles bare port strings (e.g., a standalone arg
+// like "19510" that exactly matches an intended port).
 func substitutePort(s string, subs map[string]string) string {
 	for intended, actual := range subs {
 		if intended == actual {
@@ -598,6 +599,10 @@ func substitutePort(s string, subs map[string]string) string {
 		s = strings.ReplaceAll(s, ":"+intended, ":"+actual)
 		// Replace space-separated ports (nc, netcat, nmap-style commands).
 		s = strings.ReplaceAll(s, " "+intended, " "+actual)
+		// Replace exact match (standalone arg like "19510" from --ports 19510).
+		if s == intended {
+			s = actual
+		}
 	}
 	return s
 }
