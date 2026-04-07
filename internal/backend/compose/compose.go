@@ -191,7 +191,18 @@ func (b *Backend) GetPortPlan() []PortMapping {
 func (b *Backend) QueryPorts(ctx context.Context, mappings []PortMapping) error {
 	b.portSubs = make(map[string]string)
 	for _, m := range mappings {
-		stdout, _, err := b.run(ctx, "port", m.Service, m.ContainerPort)
+		// Docker compose port command needs --protocol flag for UDP,
+		// and the container port without the /udp suffix.
+		containerPort := m.ContainerPort
+		var args []string
+		if strings.HasSuffix(containerPort, "/udp") {
+			containerPort = strings.TrimSuffix(containerPort, "/udp")
+			args = []string{"port", "--protocol", "udp", m.Service, containerPort}
+		} else {
+			containerPort = strings.TrimSuffix(containerPort, "/tcp")
+			args = []string{"port", m.Service, containerPort}
+		}
+		stdout, _, err := b.run(ctx, args...)
 		if err != nil {
 			return fmt.Errorf("querying port %s/%s: %w", m.Service, m.ContainerPort, err)
 		}
