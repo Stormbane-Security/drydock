@@ -90,7 +90,8 @@ Run flags:
   --artifacts <dir>       Artifact output directory (default: .drydock/runs)
   --json                  Output results as JSON
   --ci                    CI mode: plain-text output, writes JUnit XML to artifacts dir
-  --skip-teardown         Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)`)
+  --skip-teardown         Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)
+  --keep                  Alias for --skip-teardown`)
 }
 
 func fatalf(format string, args ...any) {
@@ -132,6 +133,8 @@ func cmdRun(args []string) {
 	fixedPorts := fs.Bool("fixed-ports", false, "use fixed host ports from YAML instead of random ephemeral ports")
 	ciMode := fs.Bool("ci", false, "CI mode: plain-text output, writes JUnit XML to artifacts dir")
 	skipTeardown := fs.Bool("skip-teardown", false, "do not destroy backends/fixtures after the run")
+	keep := fs.Bool("keep", false, "alias for --skip-teardown")
+
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
@@ -168,7 +171,7 @@ func cmdRun(args []string) {
 		fatalf("no matching scenarios found")
 	}
 
-	if *skipTeardown {
+	if *skipTeardown || *keep {
 		for _, s := range scenarios {
 			s.SkipTeardown = true
 		}
