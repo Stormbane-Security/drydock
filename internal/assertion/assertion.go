@@ -333,6 +333,21 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Run beacon scan with proper argument separation (no shell injection).
 	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
+	// Auto-approve exploit modules in drydock tests (non-interactive).
+	// Without --yes, beacon's per-module approval prompt auto-denies in non-TTY mode.
+	hasAuthorized := false
+	hasYes := false
+	for _, arg := range a.Args {
+		if arg == "--authorized" {
+			hasAuthorized = true
+		}
+		if arg == "--yes" {
+			hasYes = true
+		}
+	}
+	if hasAuthorized && !hasYes {
+		argv = append(argv, "--yes")
+	}
 	// Set BEACON_AUTHORIZED_ACK=1 to skip interactive confirmation in authorized mode.
 	// Drydock tests run against sandboxed infrastructure we own.
 	beaconEnv := make(map[string]string)
