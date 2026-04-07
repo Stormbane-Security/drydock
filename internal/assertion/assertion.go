@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +22,23 @@ import (
 	"github.com/stormbane-security/drydock/internal/runner"
 	"github.com/stormbane-security/drydock/internal/scenario"
 )
+
+// ── Beacon artifact context ──────────────────────────────────────────────
+// Package-level state for persisting beacon output to the artifact store.
+// Set via SetArtifactContext before calling Run.
+
+var (
+	beaconArtifactStore *artifact.Store
+	beaconArtifactRunID string
+)
+
+// SetArtifactContext configures the artifact store and run ID used by beacon
+// assertions to persist raw scan output. If not called, beacon output capture
+// is silently skipped.
+func SetArtifactContext(store *artifact.Store, runID string) {
+	beaconArtifactStore = store
+	beaconArtifactRunID = runID
+}
 
 // Run evaluates all assertions in a scenario against the live environment.
 func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[string]string, baseDir string, env map[string]string) []artifact.AssertionResult {
@@ -426,6 +445,15 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		}
 	}
 
+	// ── Feature: Beacon Output Capture ───────────────────────────────────
+	// Persist raw beacon JSON to the artifact store for post-run analysis.
+	if beaconArtifactStore != nil && beaconArtifactRunID != "" && r.Stdout != "" {
+		artifactName := fmt.Sprintf("beacon-%s.json", a.Name)
+		if err := beaconArtifactStore.SaveFile(beaconArtifactRunID, artifactName, []byte(r.Stdout)); err != nil {
+			log.Printf("warning: failed to save beacon artifact %s: %v", artifactName, err)
+		}
+	}
+
 	// Build the list of expectations to check.
 	// If Expectations (list form) is set, use it. Otherwise wrap the single Expect.
 	expectations := a.Expectations
@@ -442,6 +470,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 
 		if err := checkBeaconExpectation(expect, findings, label); err != "" {
 			result.Message = err
+			result.Detail = beaconCoverageReport(findings, expectations)
 			return result
 		}
 	}
@@ -457,6 +486,10 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 		detail += fmt.Sprintf(", %s absent", a.Expect.NotCheckID)
 	}
 	result.Message = detail
+
+	// ── Feature: Coverage Report ─────────────────────────────────────────
+	result.Detail = beaconCoverageReport(findings, expectations)
+
 	return result
 }
 
@@ -597,6 +630,77 @@ func checkBeaconExpectation(expect scenario.AssertionExpect, findings []beaconFi
 	}
 
 	return ""
+}
+
+// beaconCoverageReport builds a human-readable summary of which check IDs were
+// found vs expected across all expectations. This helps diagnose scan gaps.
+func beaconCoverageReport(findings []beaconFinding, expectations []scenario.AssertionExpect) string {
+	// Deduplicated set of found check IDs.
+	foundSet := make(map[string]struct{})
+	for _, f := range findings {
+		if f.CheckID != "" {
+			foundSet[f.CheckID] = struct{}{}
+		}
+	}
+	foundIDs := make([]string, 0, len(foundSet))
+	for id := range foundSet {
+		foundIDs = append(foundIDs, id)
+	}
+	sort.Strings(foundIDs)
+
+	// Collect expected check IDs (positive expectations only).
+	expectedSet := make(map[string]struct{})
+	for _, e := range expectations {
+		if e.CheckID != "" {
+			expectedSet[e.CheckID] = struct{}{}
+		}
+	}
+	expectedIDs := make([]string, 0, len(expectedSet))
+	for id := range expectedSet {
+		expectedIDs = append(expectedIDs, id)
+	}
+	sort.Strings(expectedIDs)
+
+	// Unexpected = found but not in the expected set.
+	var unexpectedIDs []string
+	for _, id := range foundIDs {
+		if _, ok := expectedSet[id]; !ok {
+			unexpectedIDs = append(unexpectedIDs, id)
+		}
+	}
+
+	// Determine which expected IDs were actually found.
+	var matchedIDs []string
+	var missingIDs []string
+	for _, id := range expectedIDs {
+		if _, ok := foundSet[id]; ok {
+			matchedIDs = append(matchedIDs, id)
+		} else {
+			missingIDs = append(missingIDs, id)
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "=== Beacon Coverage Report ===\n")
+	fmt.Fprintf(&b, "Total findings: %d\n", len(findings))
+	fmt.Fprintf(&b, "Unique check_ids found: %s\n", formatIDList(foundIDs))
+	fmt.Fprintf(&b, "Expected check_ids: %s\n", formatIDList(expectedIDs))
+	fmt.Fprintf(&b, "Matched: %s\n", formatIDList(matchedIDs))
+	if len(missingIDs) > 0 {
+		fmt.Fprintf(&b, "Missing (expected but not found): %s\n", formatIDList(missingIDs))
+	}
+	if len(unexpectedIDs) > 0 {
+		fmt.Fprintf(&b, "Unexpected (found but not expected): %s\n", formatIDList(unexpectedIDs))
+	}
+	return b.String()
+}
+
+// formatIDList formats a slice of IDs for display; returns "(none)" if empty.
+func formatIDList(ids []string) string {
+	if len(ids) == 0 {
+		return "(none)"
+	}
+	return strings.Join(ids, ", ")
 }
 
 // ── Classify assertion ────────────────────────────────────────────────────

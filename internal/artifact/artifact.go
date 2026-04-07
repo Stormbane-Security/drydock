@@ -33,6 +33,7 @@ type AssertionResult struct {
 	Type    string `json:"type"`
 	Passed  bool   `json:"passed"`
 	Message string `json:"message,omitempty"`
+	Detail  string `json:"detail,omitempty"` // Extended info (e.g. beacon coverage report)
 }
 
 // Store manages artifact storage on disk.
