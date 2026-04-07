@@ -663,6 +663,12 @@ func substitutePort(s string, subs map[string]string) string {
 		s = strings.ReplaceAll(s, ":"+intended, ":"+actual)
 		// Replace space-separated ports (nc, netcat, nmap-style commands).
 		s = strings.ReplaceAll(s, " "+intended, " "+actual)
+		// Replace comma-separated ports (--ports 8080,9200,6379).
+		s = strings.ReplaceAll(s, ","+intended, ","+actual)
+		// Replace port at start of comma-separated list (first element has no prefix).
+		if strings.HasPrefix(s, intended+",") {
+			s = actual + s[len(intended):]
+		}
 		// Replace exact match (standalone arg like "19510" from --ports 19510).
 		if s == intended {
 			s = actual
