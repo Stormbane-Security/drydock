@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,6 +51,8 @@ func main() {
 		cmdValidate(args)
 	case "run":
 		cmdRun(args)
+	case "pull":
+		cmdPull(args)
 	case "debug":
 		cmdDebug(args)
 	case "destroy":
@@ -77,6 +80,7 @@ func usage() {
 Usage:
   drydock validate <path>              Validate a scenario file or directory
   drydock run [flags] <path>           Run a scenario or all scenarios in a directory
+  drydock pull <path>                  Pre-pull all Docker images referenced in scenarios
   drydock debug <path>                 Start infrastructure and wait for manual testing
   drydock destroy <path>               Tear down a scenario's environment
   drydock inspect <run-id>             Show results of a previous run
@@ -85,13 +89,16 @@ Usage:
   drydock version                      Print version
 
 Run flags:
-  --tags <tag1,tag2>      Only run scenarios with matching tags
-  --matrix <k=v,...>      Filter matrix variants (e.g. database=postgres)
-  --artifacts <dir>       Artifact output directory (default: .drydock/runs)
-  --json                  Output results as JSON
-  --ci                    CI mode: plain-text output, writes JUnit XML to artifacts dir
-  --skip-teardown         Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)
-  --keep                  Alias for --skip-teardown`)
+  --tags <tag1,tag2>        Only run scenarios with matching tags
+  --exclude-tags <t1,t2>    Skip scenarios with matching tags
+  --matrix <k=v,...>        Filter matrix variants (e.g. database=postgres)
+  --parallel <N>            Run N scenarios concurrently (default: 1, sequential)
+  --retry <N>               Retry failed scenarios up to N times (default: 0)
+  --artifacts <dir>         Artifact output directory (default: .drydock/runs)
+  --json                    Output results as JSON
+  --ci                      CI mode: plain-text output, writes JUnit XML to artifacts dir
+  --skip-teardown           Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)
+  --keep                    Alias for --skip-teardown`)
 }
 
 func fatalf(format string, args ...any) {
@@ -124,10 +131,21 @@ func requireDocker() {
 	}
 }
 
+// scenarioResult holds the outcome of running a single scenario, including retry info.
+type scenarioResult struct {
+	scenario *scenario.Scenario
+	record   *artifact.RunRecord
+	err      error // non-nil when eng.Run itself errors (no record)
+	retries  int   // number of retries it took (0 = first attempt succeeded)
+}
+
 func cmdRun(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	tags := fs.String("tags", "", "comma-separated tags to filter scenarios")
+	excludeTags := fs.String("exclude-tags", "", "comma-separated tags to exclude scenarios")
 	matrixFilter := fs.String("matrix", "", "filter matrix variants (e.g. database=postgres,cache=redis)")
+	parallel := fs.Int("parallel", 1, "number of scenarios to run concurrently")
+	retry := fs.Int("retry", 0, "retry failed scenarios up to N times")
 	artifactDir := fs.String("artifacts", ".drydock/runs", "artifact output directory")
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
 	fixedPorts := fs.Bool("fixed-ports", false, "use fixed host ports from YAML instead of random ephemeral ports")
@@ -143,12 +161,24 @@ func cmdRun(args []string) {
 
 	scenarios := loadScenarios(fs.Arg(0))
 
-	// Filter by tags.
+	// Filter by tags (include).
 	if *tags != "" {
 		filterTags := strings.Split(*tags, ",")
 		var filtered []*scenario.Scenario
 		for _, s := range scenarios {
 			if matchesTags(s.Tags, filterTags) {
+				filtered = append(filtered, s)
+			}
+		}
+		scenarios = filtered
+	}
+
+	// Filter by tags (exclude).
+	if *excludeTags != "" {
+		excTags := strings.Split(*excludeTags, ",")
+		var filtered []*scenario.Scenario
+		for _, s := range scenarios {
+			if !matchesTags(s.Tags, excTags) {
 				filtered = append(filtered, s)
 			}
 		}
@@ -200,6 +230,11 @@ func cmdRun(args []string) {
 		}
 	}
 
+	// Clamp parallel to valid range.
+	if *parallel < 1 {
+		*parallel = 1
+	}
+
 	// Set up signal handling for graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -220,48 +255,75 @@ func cmdRun(args []string) {
 		}
 	}
 
-	// Run scenarios.
+	// runOneScenario executes a single scenario with retry logic.
+	runOne := func(s *scenario.Scenario) scenarioResult {
+		maxAttempts := 1 + *retry
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			record, err := eng.Run(ctx, s)
+			if err != nil {
+				// Engine-level error (no record). Retry if attempts remain.
+				if attempt < maxAttempts-1 {
+					continue
+				}
+				return scenarioResult{scenario: s, err: err, retries: attempt}
+			}
+			if record.Status == "pass" || attempt >= maxAttempts-1 {
+				return scenarioResult{scenario: s, record: record, retries: attempt}
+			}
+			// Status is fail or error — retry.
+		}
+		// Should not reach here, but be safe.
+		return scenarioResult{scenario: s, err: fmt.Errorf("exhausted retries")}
+	}
+
+	// Run scenarios (parallel or sequential).
+	results := runScenarios(ctx, scenarios, *parallel, runOne)
+
+	// Report results.
 	var passed, failed, errored int
 	var records []*artifact.RunRecord
-	for _, s := range scenarios {
-		if *ciMode {
-			fmt.Fprintf(os.Stderr, "--- RUN  %s\n", s.Name)
-		} else {
-			fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
-		}
-		record, err := eng.Run(ctx, s)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	for _, r := range results {
+		if r.err != nil {
 			errored++
+			if *ciMode {
+				fmt.Fprintf(os.Stderr, "--- ERROR %s: %v\n", r.scenario.Name, r.err)
+			} else {
+				fmt.Fprintf(os.Stderr, "ERROR: %s: %v\n", r.scenario.Name, r.err)
+			}
 			continue
 		}
-		records = append(records, record)
+		records = append(records, r.record)
 
 		if *jsonOutput {
-			data, _ := json.MarshalIndent(record, "", "  ")
+			data, _ := json.MarshalIndent(r.record, "", "  ")
 			fmt.Println(string(data))
 		}
 
-		switch record.Status {
+		retryNote := ""
+		if r.retries > 0 {
+			retryNote = fmt.Sprintf(" (retry %d)", r.retries)
+		}
+
+		switch r.record.Status {
 		case "pass":
 			passed++
 			if *ciMode {
-				fmt.Fprintf(os.Stderr, "--- PASS %s (%.1fs)\n", s.Name, record.Duration.Seconds())
+				fmt.Fprintf(os.Stderr, "--- PASS %s%s (%.1fs)\n", r.scenario.Name, retryNote, r.record.Duration.Seconds())
 			} else {
-				fmt.Fprintf(os.Stderr, "✓ %s PASSED (%.1fs)\n", s.Name, record.Duration.Seconds())
+				fmt.Fprintf(os.Stderr, "✓ %s PASSED%s (%.1fs)\n", r.scenario.Name, retryNote, r.record.Duration.Seconds())
 			}
 		case "fail":
 			failed++
 			if *ciMode {
-				fmt.Fprintf(os.Stderr, "--- FAIL %s: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
-				for _, ar := range record.AssertionResults {
+				fmt.Fprintf(os.Stderr, "--- FAIL %s: %s (%.1fs)\n", r.scenario.Name, r.record.Error, r.record.Duration.Seconds())
+				for _, ar := range r.record.AssertionResults {
 					if !ar.Passed {
 						fmt.Fprintf(os.Stderr, "    %s: %s\n", ar.Name, ar.Message)
 					}
 				}
 			} else {
-				fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
-				for _, ar := range record.AssertionResults {
+				fmt.Fprintf(os.Stderr, "✗ %s FAILED: %s (%.1fs)\n", r.scenario.Name, r.record.Error, r.record.Duration.Seconds())
+				for _, ar := range r.record.AssertionResults {
 					if !ar.Passed {
 						fmt.Fprintf(os.Stderr, "  FAIL: %s — %s\n", ar.Name, ar.Message)
 					}
@@ -270,9 +332,9 @@ func cmdRun(args []string) {
 		default:
 			errored++
 			if *ciMode {
-				fmt.Fprintf(os.Stderr, "--- ERROR %s: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+				fmt.Fprintf(os.Stderr, "--- ERROR %s: %s (%.1fs)\n", r.scenario.Name, r.record.Error, r.record.Duration.Seconds())
 			} else {
-				fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", s.Name, record.Error, record.Duration.Seconds())
+				fmt.Fprintf(os.Stderr, "! %s ERROR: %s (%.1fs)\n", r.scenario.Name, r.record.Error, r.record.Duration.Seconds())
 			}
 		}
 	}
@@ -286,6 +348,101 @@ func cmdRun(args []string) {
 	if failed > 0 || errored > 0 {
 		os.Exit(1)
 	}
+}
+
+// runScenarios executes scenarios with the given concurrency. When parallel is
+// 1, scenarios run sequentially preserving order. When parallel > 1, a worker
+// pool processes scenarios concurrently. Results are returned in the same order
+// as the input scenarios slice.
+func runScenarios(_ context.Context, scenarios []*scenario.Scenario, parallel int, runOne func(*scenario.Scenario) scenarioResult) []scenarioResult {
+	results := make([]scenarioResult, len(scenarios))
+
+	if parallel <= 1 {
+		// Sequential execution.
+		for i, s := range scenarios {
+			fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", s.Name)
+			results[i] = runOne(s)
+		}
+		return results
+	}
+
+	// Parallel execution with semaphore pattern.
+	type indexedScenario struct {
+		index    int
+		scenario *scenario.Scenario
+	}
+
+	work := make(chan indexedScenario, len(scenarios))
+	for i, s := range scenarios {
+		work <- indexedScenario{index: i, scenario: s}
+	}
+	close(work)
+
+	var wg sync.WaitGroup
+	wg.Add(parallel)
+	for w := 0; w < parallel; w++ {
+		go func() {
+			defer wg.Done()
+			for item := range work {
+				fmt.Fprintf(os.Stderr, "\n═══ Running: %s ═══\n", item.scenario.Name)
+				results[item.index] = runOne(item.scenario)
+			}
+		}()
+	}
+	wg.Wait()
+
+	return results
+}
+
+func cmdPull(args []string) {
+	if len(args) == 0 {
+		fatalf("usage: drydock pull <scenario-path>")
+	}
+
+	scenarios := loadScenarios(args[0])
+
+	// Collect unique images from all scenarios.
+	images := collectImages(scenarios)
+	if len(images) == 0 {
+		fmt.Fprintln(os.Stderr, "drydock: no images to pull")
+		return
+	}
+
+	requireDocker()
+
+	fmt.Fprintf(os.Stderr, "drydock: pulling %d unique images...\n", len(images))
+	var failed int
+	for i, img := range images {
+		fmt.Fprintf(os.Stderr, "  [%d/%d] %s\n", i+1, len(images), img)
+		cmd := exec.Command("docker", "pull", img)
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "  WARN: failed to pull %s: %v\n", img, err)
+			failed++
+		}
+	}
+	fmt.Fprintf(os.Stderr, "drydock: pulled %d/%d images\n", len(images)-failed, len(images))
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+// collectImages extracts unique Docker image names from all scenarios' services
+// and old-format backends. Images with build-only configs (no image field) are skipped.
+func collectImages(scenarios []*scenario.Scenario) []string {
+	seen := make(map[string]bool)
+	var images []string
+	for _, s := range scenarios {
+		for _, svc := range s.Services {
+			if svc.Image != "" && !seen[svc.Image] {
+				seen[svc.Image] = true
+				images = append(images, svc.Image)
+			}
+		}
+	}
+	sort.Strings(images)
+	return images
 }
 
 func cmdDebug(args []string) {
