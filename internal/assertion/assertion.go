@@ -54,6 +54,8 @@ func Run(ctx context.Context, assertions []scenario.Assertion, outputs map[strin
 			result = checkGitHubStep(a, outputs)
 		case "github-artifact":
 			result = checkGitHubArtifact(a, outputs)
+		case "ghcollect":
+			result = checkGhcollect(ctx, a, baseDir, env)
 		default:
 			result.Message = fmt.Sprintf("unsupported assertion type: %s", a.Type)
 		}
@@ -344,6 +346,24 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	if tmpErr == nil {
 		beaconEnv["HOME"] = tmpHome
 		defer os.RemoveAll(tmpHome)
+	}
+
+	// Generate a temporary beacon config file when auth is configured.
+	if a.Auth != nil {
+		cfgYAML := fmt.Sprintf("auth:\n  - asset: \"*\"\n    method: %s\n", a.Auth.Method)
+		if a.Auth.Token != "" {
+			cfgYAML += fmt.Sprintf("    token: %s\n", a.Auth.Token)
+		}
+		if a.Auth.Username != "" {
+			cfgYAML += fmt.Sprintf("    username: %s\n", a.Auth.Username)
+		}
+		if a.Auth.Password != "" {
+			cfgYAML += fmt.Sprintf("    password: %s\n", a.Auth.Password)
+		}
+		cfgPath := filepath.Join(tmpHome, "beacon-auth.yaml")
+		if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err == nil {
+			beaconEnv["BEACON_CONFIG"] = cfgPath
+		}
 	}
 	// Ensure $GOPATH/bin is on PATH so go-installed binaries are found.
 	// Append to existing PATH (which may already include test overrides) rather
@@ -920,6 +940,105 @@ func checkGitHubArtifact(a scenario.Assertion, outputs map[string]string) artifa
 
 	result.Passed = true
 	result.Message = fmt.Sprintf("artifact %s present", a.Expect.ArtifactName)
+	return result
+}
+
+func checkGhcollect(ctx context.Context, a scenario.Assertion, baseDir string, env map[string]string) artifact.AssertionResult {
+	result := artifact.AssertionResult{}
+
+	snapPath := a.Target
+	if !filepath.IsAbs(snapPath) {
+		snapPath = filepath.Join(baseDir, snapPath)
+	}
+
+	bin := os.Getenv("GHCOLLECT_BIN")
+	if bin == "" {
+		bin = "ghcollect"
+	}
+	analyzers := a.Expect.GhcollectAnalyzers
+	if analyzers == "" {
+		analyzers = "actions"
+	}
+
+	assertTimeout := 120 * time.Second
+	if a.Expect.Timeout.Duration > 0 {
+		assertTimeout = a.Expect.Timeout.Duration
+	}
+	ctx, cancel := context.WithTimeout(ctx, assertTimeout)
+	defer cancel()
+
+	argv := []string{bin, "analyze", "-snapshot", snapPath, "-analyzers", analyzers}
+	for _, arg := range a.Args {
+		argv = append(argv, arg)
+	}
+
+	r := runner.RunExec(ctx, a.Name, argv, baseDir, env)
+	if r.ExitCode != 0 || r.Error != "" {
+		result.Message = fmt.Sprintf("ghcollect exited %d: %s\nstderr: %s", r.ExitCode, r.Error, r.Stderr)
+		return result
+	}
+	out := r.Stdout
+
+	if a.Expect.Stdout != "" && !strings.Contains(out, a.Expect.Stdout) {
+		result.Message = fmt.Sprintf("ghcollect stdout does not contain %q", a.Expect.Stdout)
+		return result
+	}
+	if a.Expect.NotStdout != "" && strings.Contains(out, a.Expect.NotStdout) {
+		result.Message = fmt.Sprintf("ghcollect stdout should not contain %q", a.Expect.NotStdout)
+		return result
+	}
+
+	dec := json.NewDecoder(strings.NewReader(out))
+	var findings []struct {
+		CheckID string `json:"check_id"`
+	}
+	for {
+		var f struct {
+			CheckID string `json:"check_id"`
+		}
+		err := dec.Decode(&f)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			result.Message = fmt.Sprintf("parse ghcollect JSON: %v", err)
+			return result
+		}
+		findings = append(findings, f)
+	}
+
+	if a.Expect.MinFindings != nil && len(findings) < *a.Expect.MinFindings {
+		result.Message = fmt.Sprintf("expected at least %d findings, got %d", *a.Expect.MinFindings, len(findings))
+		return result
+	}
+	if a.Expect.MaxFindings != nil && len(findings) > *a.Expect.MaxFindings {
+		result.Message = fmt.Sprintf("expected at most %d findings, got %d", *a.Expect.MaxFindings, len(findings))
+		return result
+	}
+	if a.Expect.CheckID != "" {
+		found := false
+		for _, f := range findings {
+			if f.CheckID == a.Expect.CheckID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result.Message = fmt.Sprintf("no finding with check_id %q (got %d finding(s))", a.Expect.CheckID, len(findings))
+			return result
+		}
+	}
+	if a.Expect.NotCheckID != "" {
+		for _, f := range findings {
+			if f.CheckID == a.Expect.NotCheckID {
+				result.Message = fmt.Sprintf("unexpected finding with check_id %q", a.Expect.NotCheckID)
+				return result
+			}
+		}
+	}
+
+	result.Passed = true
+	result.Message = fmt.Sprintf("ghcollect ok (%d finding object(s) in output)", len(findings))
 	return result
 }
 

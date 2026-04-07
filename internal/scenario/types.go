@@ -166,6 +166,10 @@ type Scenario struct {
 	// Commands are the test steps to execute against the environment.
 	Commands []Command `yaml:"commands"`
 
+	// PostExploit runs after assertions succeed (lateral-move / follow-on steps in the lab).
+	// Failures mark the scenario as failed; teardown still runs unless skip_teardown is set.
+	PostExploit []Command `yaml:"post_exploit,omitempty"`
+
 	// Assertions validate the environment state after commands run.
 	Assertions []Assertion `yaml:"assertions,omitempty"`
 
@@ -185,6 +189,10 @@ type Scenario struct {
 
 	// Env injects environment variables into all commands and backends.
 	Env map[string]string `yaml:"env,omitempty"`
+
+	// SkipTeardown leaves backends and fixtures running after the run (debugging).
+	// Prefer the CLI flag --skip-teardown or env DRYDOCK_SKIP_TEARDOWN=1 for one-off use.
+	SkipTeardown bool `yaml:"skip_teardown,omitempty"`
 
 	// Tags enable filtering scenarios by category.
 	Tags []string `yaml:"tags,omitempty"`
@@ -438,6 +446,7 @@ type Assertion struct {
 	//   "beacon"         — Run beacon scan, check for findings
 	//   "beacon_output"  — Read beacon JSON output file, check for findings
 	//   "classify"       — Run beacon classify, check asset classification
+	//   "ghcollect"      — Run ghcollect analyze on a snapshot path (target)
 	Type string `yaml:"type"`
 
 	// Target is assertion-type-specific (URL for http, host:port for port, etc.)
@@ -459,6 +468,19 @@ type Assertion struct {
 	// multiple findings exist. If both Expect and Expectations are set,
 	// Expectations takes precedence for beacon assertions.
 	Expectations []AssertionExpect `yaml:"expectations,omitempty"`
+
+	// Auth configures authenticated scanning for beacon assertions.
+	// When set, a temporary beacon config file is generated with this auth
+	// entry and passed via BEACON_CONFIG.
+	Auth *AssertionAuth `yaml:"auth,omitempty"`
+}
+
+// AssertionAuth defines auth credentials for beacon scan assertions.
+type AssertionAuth struct {
+	Method   string `yaml:"method"`             // bearer, basic, api_key, cookie, form, oidc, oidc_code, web3_evm, web3_sol
+	Token    string `yaml:"token,omitempty"`     // bearer/api_key token
+	Username string `yaml:"username,omitempty"`  // basic/form username
+	Password string `yaml:"password,omitempty"`  // basic/form password
 }
 
 // AssertionExpect defines expected outcomes for assertions.
@@ -504,6 +526,9 @@ type AssertionExpect struct {
 	Job          string `yaml:"job,omitempty"`           // job name to assert on
 	StepName     string `yaml:"step_name,omitempty"`     // step name within a job
 	ArtifactName string `yaml:"artifact_name,omitempty"` // artifact that should be present
+
+	// Ghcollect assertions (type: ghcollect) — passed to ghcollect analyze -analyzers
+	GhcollectAnalyzers string `yaml:"ghcollect_analyzers,omitempty"`
 
 	// Classify assertions — beacon classify --format json output fields
 	ProxyType       string `yaml:"proxy_type,omitempty"`       // exact match on proxy_type
@@ -634,8 +659,15 @@ func (s *Scenario) Validate() error {
 				return fmt.Errorf("backend.terraform_dir is required for terraform backend")
 			}
 		case "hybrid":
-			if s.Backend.ComposeFile == "" && s.Backend.TerraformDir == "" {
-				return fmt.Errorf("hybrid backend requires at least compose_file or terraform_dir")
+			hasCompose := s.Backend.ComposeFile != ""
+			hasTF := s.Backend.TerraformDir != ""
+			hasGA := s.Backend.Repo != "" && s.Backend.Workflow != ""
+			if !hasCompose && !hasTF && !hasGA {
+				return fmt.Errorf("hybrid backend requires at least one of compose_file, terraform_dir, or github repo+workflow")
+			}
+			if (s.Backend.Repo != "" || s.Backend.Workflow != "") &&
+				!(s.Backend.Repo != "" && s.Backend.Workflow != "") {
+				return fmt.Errorf("hybrid github-actions component requires both backend.repo and backend.workflow")
 			}
 		case "github-actions":
 			if s.Backend.Repo == "" {
@@ -660,16 +692,27 @@ func (s *Scenario) Validate() error {
 			return fmt.Errorf("command[%d].run is required", i)
 		}
 	}
+	for i, c := range s.PostExploit {
+		if c.Name == "" {
+			return fmt.Errorf("post_exploit[%d].name is required", i)
+		}
+		if c.Run == "" {
+			return fmt.Errorf("post_exploit[%d].run is required", i)
+		}
+	}
 	for i, a := range s.Assertions {
 		if a.Name == "" {
 			return fmt.Errorf("assertion[%d].name is required", i)
 		}
 		switch a.Type {
 		case "http", "port", "command", "terraform", "file", "beacon", "beacon_output",
-			"classify", "github-run", "github-job", "github-step", "github-artifact":
+			"classify", "github-run", "github-job", "github-step", "github-artifact", "ghcollect":
 			// valid
 		default:
 			return fmt.Errorf("assertion[%d]: unsupported type %q", i, a.Type)
+		}
+		if a.Type == "ghcollect" && a.Target == "" {
+			return fmt.Errorf("assertion[%d]: ghcollect requires target (path to manifest.json or snapshot directory)", i)
 		}
 	}
 	return nil

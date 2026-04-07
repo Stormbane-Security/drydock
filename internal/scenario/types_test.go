@@ -313,15 +313,32 @@ func TestValidate_GitHubActionsRequiresWorkflow(t *testing.T) {
 }
 
 func TestValidate_GitHubAssertionTypes(t *testing.T) {
-	for _, typ := range []string{"github-run", "github-job", "github-step", "github-artifact"} {
+	for _, typ := range []string{"github-run", "github-job", "github-step", "github-artifact", "ghcollect"} {
 		s := &Scenario{
 			Name:    "test",
 			Backend: Backend{Type: "compose", ComposeFile: "compose.yaml"},
-			Assertions: []Assertion{{Name: "check", Type: typ}},
+			Assertions: []Assertion{{
+				Name:   "check",
+				Type:   typ,
+				Target: "./snap/manifest.json",
+			}},
 		}
 		if err := s.Validate(); err != nil {
 			t.Errorf("expected %s assertion type to be valid, got: %v", typ, err)
 		}
+	}
+}
+
+func TestValidate_GhcollectRequiresTarget(t *testing.T) {
+	s := &Scenario{
+		Name:    "gc",
+		Backend: Backend{Type: "compose", ComposeFile: "compose.yaml"},
+		Assertions: []Assertion{
+			{Name: "a", Type: "ghcollect"},
+		},
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected error for ghcollect without target")
 	}
 }
 
@@ -584,7 +601,37 @@ func TestValidate_HybridBackend_MissingBoth(t *testing.T) {
 		Commands: []Command{{Name: "test", Run: "echo ok"}},
 	}
 	if err := s.Validate(); err == nil {
-		t.Error("expected error for hybrid without compose_file or terraform_dir")
+		t.Error("expected error for hybrid without compose_file, terraform_dir, or github repo+workflow")
+	}
+}
+
+func TestValidate_HybridBackend_GitHubOnly(t *testing.T) {
+	s := &Scenario{
+		Name: "hybrid-ga",
+		Backend: Backend{
+			Type:     "hybrid",
+			Repo:     "acme/lab",
+			Workflow: "smoke.yml",
+		},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("expected valid hybrid with github-actions only: %v", err)
+	}
+}
+
+func TestValidate_HybridBackend_GitHubPartial(t *testing.T) {
+	s := &Scenario{
+		Name: "hybrid-partial",
+		Backend: Backend{
+			Type:     "hybrid",
+			Repo:     "acme/lab",
+			Workflow: "",
+		},
+		Commands: []Command{{Name: "test", Run: "echo ok"}},
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatal("expected error when only repo is set for github-actions component")
 	}
 }
 

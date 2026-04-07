@@ -89,7 +89,8 @@ Run flags:
   --matrix <k=v,...>      Filter matrix variants (e.g. database=postgres)
   --artifacts <dir>       Artifact output directory (default: .drydock/runs)
   --json                  Output results as JSON
-  --ci                    CI mode: plain-text output, writes JUnit XML to artifacts dir`)
+  --ci                    CI mode: plain-text output, writes JUnit XML to artifacts dir
+  --skip-teardown         Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)`)
 }
 
 func fatalf(format string, args ...any) {
@@ -104,6 +105,7 @@ func cmdValidate(args []string) {
 
 	scenarios := loadScenarios(args[0])
 	for _, s := range scenarios {
+		scenario.ExpandEnvBeforeValidate(s)
 		if err := s.Validate(); err != nil {
 			fatalf("validation failed for %q: %v", s.Name, err)
 		}
@@ -129,13 +131,12 @@ func cmdRun(args []string) {
 	jsonOutput := fs.Bool("json", false, "output results as JSON")
 	fixedPorts := fs.Bool("fixed-ports", false, "use fixed host ports from YAML instead of random ephemeral ports")
 	ciMode := fs.Bool("ci", false, "CI mode: plain-text output, writes JUnit XML to artifacts dir")
+	skipTeardown := fs.Bool("skip-teardown", false, "do not destroy backends/fixtures after the run")
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
 		fatalf("usage: drydock run [--tags <tags>] [--matrix <key=val,...>] <scenario-path>")
 	}
-
-	requireDocker()
 
 	scenarios := loadScenarios(fs.Arg(0))
 
@@ -165,6 +166,23 @@ func cmdRun(args []string) {
 
 	if len(scenarios) == 0 {
 		fatalf("no matching scenarios found")
+	}
+
+	if *skipTeardown {
+		for _, s := range scenarios {
+			s.SkipTeardown = true
+		}
+	}
+
+	needsDocker := false
+	for _, s := range scenarios {
+		scenario.ExpandEnvBeforeValidate(s)
+		if s.NeedsDocker() {
+			needsDocker = true
+		}
+	}
+	if needsDocker {
+		requireDocker()
 	}
 
 	// Sort by weight descending so heavy/slow tests start first.
@@ -277,8 +295,6 @@ func cmdDebug(args []string) {
 		fatalf("usage: drydock debug [--matrix <key=val>] <scenario-path>")
 	}
 
-	requireDocker()
-
 	s, err := scenario.Load(fs.Arg(0))
 	if err != nil {
 		fatalf("loading scenario: %v", err)
@@ -313,8 +329,13 @@ func cmdDebug(args []string) {
 	// Apply --fixed-ports flag (defaults to true for debug mode).
 	s.FixedPorts = *fixedPorts
 
+	scenario.ExpandEnvBeforeValidate(s)
 	if err := s.Validate(); err != nil {
 		fatalf("validation failed: %v", err)
+	}
+
+	if s.NeedsDocker() {
+		requireDocker()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -362,6 +383,7 @@ func cmdDestroy(args []string) {
 	ctx := context.Background()
 
 	for _, s := range scenarios {
+		scenario.ExpandEnvBeforeValidate(s)
 		fmt.Fprintf(os.Stderr, "destroying: %s\n", s.Name)
 		if err := eng.Destroy(ctx, s); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)

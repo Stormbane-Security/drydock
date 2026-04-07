@@ -37,6 +37,14 @@ func Scenario(s *scenario.Scenario, outputs map[string]string) error {
 	// Scenario-level env.
 	resolveMap(s.Env, &errs, outputs)
 
+	if s.Ready != nil {
+		s.Ready.Cmd = r(s.Ready.Cmd)
+	}
+
+	for i := range s.Run {
+		s.Run[i] = r(s.Run[i])
+	}
+
 	// Setup and command fields.
 	for i := range s.Setup {
 		s.Setup[i].Run = r(s.Setup[i].Run)
@@ -47,6 +55,12 @@ func Scenario(s *scenario.Scenario, outputs map[string]string) error {
 		s.Commands[i].Run = r(s.Commands[i].Run)
 		s.Commands[i].Dir = r(s.Commands[i].Dir)
 		resolveMap(s.Commands[i].Env, &errs, outputs)
+	}
+
+	for i := range s.PostExploit {
+		s.PostExploit[i].Run = r(s.PostExploit[i].Run)
+		s.PostExploit[i].Dir = r(s.PostExploit[i].Dir)
+		resolveMap(s.PostExploit[i].Env, &errs, outputs)
 	}
 
 	// Assertion fields.
@@ -62,6 +76,7 @@ func Scenario(s *scenario.Scenario, outputs map[string]string) error {
 		e.OutputValue = r(e.OutputValue)
 		e.OutputMatch = r(e.OutputMatch)
 		e.Contains = r(e.Contains)
+		e.GhcollectAnalyzers = r(e.GhcollectAnalyzers)
 	}
 
 	if len(errs) > 0 {

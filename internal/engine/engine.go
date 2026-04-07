@@ -45,6 +45,19 @@ func (e *Engine) log(format string, args ...any) {
 	_, _ = fmt.Fprintf(e.out, "drydock: "+format+"\n", args...)
 }
 
+func shouldTeardown(s *scenario.Scenario) bool {
+	if s.SkipTeardown {
+		return false
+	}
+	v := strings.TrimSpace(os.Getenv("DRYDOCK_SKIP_TEARDOWN"))
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return false
+	default:
+		return true
+	}
+}
+
 // Run executes a full scenario lifecycle and returns the run record.
 func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRecord, error) {
 	runID := artifact.GenerateRunID(s.Name)
@@ -66,6 +79,10 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 
 		// Defer fixture destroy FIRST so it runs LAST (after backend destroy).
 		defer func() {
+			if !shouldTeardown(s) {
+				e.log("skip_teardown: leaving fixture up")
+				return
+			}
 			e.log("destroying fixture...")
 			destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer destroyCancel()
@@ -100,6 +117,9 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 		}
 	}
 
+	// Expand OS environment variables in scenario strings (safe after ${fixture.*} interpolation).
+	scenario.ExpandScenarioEnv(s, true)
+
 	// Create backend(s).
 	backends, err := e.createBackends(s)
 	if err != nil {
@@ -111,8 +131,12 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 		return record, err
 	}
 
-	// Ensure destroy runs no matter what.
+	// Ensure destroy runs no matter what (unless skip_teardown).
 	defer func() {
+		if !shouldTeardown(s) {
+			e.log("skip_teardown: leaving backends up")
+			return
+		}
 		e.log("destroying environment...")
 		destroyCtx, destroyCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer destroyCancel()
@@ -245,6 +269,33 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 		}
 	}
 
+	assertionsPassed := assertion.AllPassed(record.AssertionResults)
+
+	// Phase 6b: Post-exploit / lateral steps (only after commands + assertions succeed).
+	postExploitPassed := true
+	if len(s.PostExploit) > 0 {
+		if !commandsPassed || !assertionsPassed {
+			e.log("skipping %d post_exploit steps (earlier phase failed)", len(s.PostExploit))
+		} else {
+			e.log("running %d post_exploit (lateral) steps...", len(s.PostExploit))
+			peSpecs := commandsToSpecs(s.PostExploit)
+			peResults := runner.RunAll(ctx, peSpecs, s.Dir, s.Env)
+			record.CommandResults = append(record.CommandResults, peResults...)
+			for _, r := range peResults {
+				if r.ExitCode != 0 || r.Error != "" {
+					postExploitPassed = false
+				}
+			}
+			if !postExploitPassed {
+				for _, r := range peResults {
+					if r.ExitCode != 0 || r.Error != "" {
+						e.log("  post_exploit FAIL: %s — exit %d %s", r.Name, r.ExitCode, r.Error)
+					}
+				}
+			}
+		}
+	}
+
 	// Phase 7: Collect logs.
 	if s.Artifacts.ContainerLogs {
 		e.log("collecting container logs...")
@@ -264,15 +315,16 @@ func (e *Engine) Run(ctx context.Context, s *scenario.Scenario) (*artifact.RunRe
 	}
 
 	// Determine final status.
-	assertionsPassed := assertion.AllPassed(record.AssertionResults)
-	if commandsPassed && assertionsPassed {
+	if commandsPassed && assertionsPassed && postExploitPassed {
 		record.Status = "pass"
 	} else {
 		record.Status = "fail"
 		if !commandsPassed {
 			record.Error = "one or more commands failed"
-		} else {
+		} else if !assertionsPassed {
 			record.Error = "one or more assertions failed"
+		} else {
+			record.Error = "one or more post_exploit steps failed"
 		}
 	}
 
@@ -379,6 +431,13 @@ func (e *Engine) createBackends(s *scenario.Scenario) ([]backend.Backend, error)
 				workspace = "drydock-" + s.Name
 			}
 			backends = append(backends, tf.New(s.Dir, s.Backend.TerraformDir, s.Backend.TerraformVars, workspace, autoApprove, s.Env))
+		}
+		if s.Backend.Repo != "" && s.Backend.Workflow != "" {
+			ref := s.Backend.Ref
+			if ref == "" {
+				ref = "main"
+			}
+			backends = append(backends, ghactions.New(s.Backend.Repo, s.Backend.Workflow, ref, s.Backend.Trigger, s.Backend.Inputs, s.Env))
 		}
 	case "github-actions":
 		ref := s.Backend.Ref
@@ -582,6 +641,11 @@ func (e *Engine) resolveEphemeralPorts(ctx context.Context, cb *compose.Backend,
 		for j := range s.Assertions[i].Args {
 			s.Assertions[i].Args[j] = substitutePort(s.Assertions[i].Args[j], subs)
 		}
+	}
+
+	for i := range s.PostExploit {
+		s.PostExploit[i].Run = substitutePort(s.PostExploit[i].Run, subs)
+		s.PostExploit[i].Dir = substitutePort(s.PostExploit[i].Dir, subs)
 	}
 
 	return nil
