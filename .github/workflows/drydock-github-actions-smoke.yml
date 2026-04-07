@@ -1,0 +1,16 @@
+# Dispatched by Drydock scenarios/test-github-actions-smoke (no cloud fixtures).
+name: Drydock GitHub Actions smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke
+        run: echo "drydock github-actions smoke"
+

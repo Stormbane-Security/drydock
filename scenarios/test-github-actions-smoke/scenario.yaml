@@ -1,0 +1,26 @@
+name: test-github-actions-smoke
+description: >
+  Minimal GitHub Actions integration test: dispatches a trivial workflow and
+  asserts the run + job succeed. No Docker Compose, Terraform, or cloud fixtures.
+tags: [github-actions, smoke]
+
+backend:
+  type: github-actions
+  repo: stormbane-security/drydock
+  workflow: drydock-github-actions-smoke.yml
+  ref: main
+
+timeout: 10m
+
+assertions:
+  - name: workflow run succeeded
+    type: github-run
+    expect:
+      conclusion: success
+
+  - name: smoke job succeeded
+    type: github-job
+    expect:
+      job: smoke
+      conclusion: success
+
