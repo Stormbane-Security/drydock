@@ -352,6 +352,10 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// Run beacon scan with proper argument separation (no shell injection).
 	argv := []string{"beacon", "scan", "--domain", a.Target, "--format", "json", "--no-enrich"}
 	argv = append(argv, a.Args...)
+	// Inject extra beacon args from --beacon-args CLI flag (e.g. "--log-level debug").
+	if extra := env["DRYDOCK_BEACON_EXTRA_ARGS"]; extra != "" {
+		argv = append(argv, strings.Fields(extra)...)
+	}
 	// Auto-approve exploit modules in drydock tests (non-interactive).
 	// Without --yes, beacon's per-module approval prompt auto-denies in non-TTY mode.
 	hasAuthorized := false
@@ -413,9 +417,11 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	} else {
 		beaconEnv["PATH"] = existingPath
 	}
+	scanStart := time.Now()
 	r := runner.RunExec(ctx, "beacon-scan", argv, baseDir, beaconEnv)
+	scanDuration := time.Since(scanStart)
 	if r.ExitCode != 0 && r.Stdout == "" {
-		result.Message = fmt.Sprintf("beacon scan failed (exit %d): %s", r.ExitCode, r.Stderr)
+		result.Message = fmt.Sprintf("beacon scan failed (exit %d, %s): %s", r.ExitCode, scanDuration.Round(time.Millisecond), r.Stderr)
 		return result
 	}
 
@@ -476,7 +482,7 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	}
 
 	result.Passed = true
-	detail := fmt.Sprintf("beacon scan completed: %d findings", len(findings))
+	detail := fmt.Sprintf("beacon scan completed: %d findings (%s)", len(findings), scanDuration.Round(time.Millisecond))
 	if len(expectations) > 1 {
 		detail += fmt.Sprintf(", all %d expectations met", len(expectations))
 	} else if a.Expect.CheckID != "" {
