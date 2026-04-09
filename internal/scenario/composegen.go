@@ -51,8 +51,10 @@ type PortPlan struct {
 	Mappings []PortMapping
 }
 
-// parsePortSpec splits a Docker Compose port string like "8080:80" or "8080"
-// into (hostPort, containerPort). If only one part, both are the same.
+// parsePortSpec splits a Docker Compose port string like "8080:80",
+// "8080:80/udp", or "8080" into (hostPort, containerPort). If only one part,
+// both are the same. The protocol suffix (/tcp, /udp) is preserved on
+// containerPort but stripped from hostPort (host ports are just numbers).
 func parsePortSpec(spec string) (host, container string) {
 	// Handle quoted specs
 	spec = strings.Trim(spec, `"'`)
@@ -60,7 +62,10 @@ func parsePortSpec(spec string) (host, container string) {
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
-	return parts[0], parts[0]
+	// Single-port spec like "53/udp" — strip protocol from host side.
+	container = parts[0]
+	host = strings.TrimSuffix(strings.TrimSuffix(container, "/udp"), "/tcp")
+	return host, container
 }
 
 // GenerateComposeFile marshals the services map into a valid Docker Compose v3

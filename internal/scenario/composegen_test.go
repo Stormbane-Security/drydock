@@ -440,6 +440,74 @@ func TestGenerateComposeFile_FixedPorts(t *testing.T) {
 	}
 }
 
+func TestParsePortSpec_UDP(t *testing.T) {
+	tests := []struct {
+		spec      string
+		wantHost  string
+		wantCont  string
+	}{
+		{"8080:80", "8080", "80"},
+		{"9430:53/udp", "9430", "53/udp"},
+		{"15353:53/tcp", "15353", "53/tcp"},
+		{"53/udp", "53", "53/udp"},
+		{"80", "80", "80"},
+		{"161/udp", "161", "161/udp"},
+	}
+	for _, tt := range tests {
+		host, container := parsePortSpec(tt.spec)
+		if host != tt.wantHost || container != tt.wantCont {
+			t.Errorf("parsePortSpec(%q) = (%q, %q), want (%q, %q)",
+				tt.spec, host, container, tt.wantHost, tt.wantCont)
+		}
+	}
+}
+
+func TestGenerateComposeFile_UDPPorts(t *testing.T) {
+	services := map[string]ComposeService{
+		"dns": {Image: "coredns/coredns", Ports: []string{"9430:53/udp", "9430:53/tcp"}},
+	}
+
+	path, plan, err := GenerateComposeFile(services, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("GenerateComposeFile: %v", err)
+	}
+	defer os.RemoveAll(strings.TrimSuffix(path, "/compose.yaml"))
+
+	// Port plan should record both mappings with protocol preserved on container side.
+	if len(plan.Mappings) != 2 {
+		t.Fatalf("expected 2 port mappings, got %d", len(plan.Mappings))
+	}
+
+	var hasUDP, hasTCP bool
+	for _, m := range plan.Mappings {
+		if m.IntendedHost != "9430" {
+			t.Errorf("expected IntendedHost=9430, got %q", m.IntendedHost)
+		}
+		switch m.ContainerPort {
+		case "53/udp":
+			hasUDP = true
+		case "53/tcp":
+			hasTCP = true
+		}
+	}
+	if !hasUDP {
+		t.Error("expected UDP port mapping in plan")
+	}
+	if !hasTCP {
+		t.Error("expected TCP port mapping in plan")
+	}
+
+	// Generated file should have ephemeral ports with protocol suffix preserved.
+	data, _ := os.ReadFile(path)
+	content := string(data)
+	if !strings.Contains(content, "0:53/udp") {
+		t.Errorf("expected ephemeral UDP port 0:53/udp in output, got:\n%s", content)
+	}
+	if !strings.Contains(content, "0:53/tcp") {
+		t.Errorf("expected ephemeral TCP port 0:53/tcp in output, got:\n%s", content)
+	}
+}
+
 func TestGenerateComposeBytes_OmitsEmptyFields(t *testing.T) {
 	services := map[string]ComposeService{
 		"minimal": {Image: "alpine"},
