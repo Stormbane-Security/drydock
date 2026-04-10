@@ -37,3 +37,83 @@ Run drydock scenarios against remote Docker hosts (SSH tunnel or Docker context)
 
 ### Scenario Dependencies
 Allow scenarios to depend on other scenarios: "run `setup-database` before `test-sqli-chain`". Enables shared infrastructure across related tests.
+
+---
+
+## v2: Runtime observation platform
+
+Drydock evolves from "compose + assertions" to a full runtime observation and testing platform.
+
+### New assertion types
+
+```yaml
+# Load testing
+- name: handles-load
+  type: load
+  target: http://localhost:8080/api/users
+  rps: 100
+  duration: 30s
+  expect:
+    p99_latency: "<500ms"
+    error_rate: "<1%"
+
+# Fault injection
+- name: survives-db-failure
+  type: fault
+  kill: postgres
+  duration: 10s
+  expect:
+    service_recovers: true
+    no_crash: true
+
+# Behavior observation
+- name: no-unexpected-egress
+  type: observe
+  expect:
+    no_outbound_except: ["postgres:5432", "redis:6379"]
+    no_unexpected_processes: true
+    no_file_writes_outside: ["/tmp", "/var/log"]
+```
+
+### Observation layer (no eBPF required initially)
+
+- Process monitoring (container events, /proc)
+- Egress proxy (all outbound connections logged)
+- DNS capture (CoreDNS logging all queries)
+- Filesystem diff (snapshot before/after, show changes)
+- stdout/stderr capture (error detection)
+- Port scan the app (what's actually listening)
+- Secret canary traps (inject canary creds, detect exfiltration)
+
+### What it catches beyond security
+
+- Crashes, panics, OOM kills, segfaults
+- Memory/goroutine/thread leaks
+- Deadlocks (process alive but unresponsive)
+- Retry storms, connection exhaustion
+- Dependency failure handling (does app crash when DB is down?)
+- Configuration errors (wrong port, missing env vars, debug mode)
+- Schema/API response validation
+- Performance degradation under load
+
+### Product positioning
+
+Not "we scan your code." Instead: "we run your app, exercise it, break things on purpose, and tell you everything that went wrong — before your users find out."
+
+The gap: code review (human or AI) tells you if code is well-written. Dynamic analysis tells you if it works. Vibe-coded apps can pass code review and completely fall apart at runtime.
+
+### Competitive landscape
+
+Nobody combines deploy + functional tests + fault injection + behavioral observation + verdict.
+- Falco: runtime monitoring, not testing
+- Chaos Monkey: fault injection only, no observation
+- DAST tools: security only, no load/fault/behavior
+- Malware sandboxes: binary analysis, not app testing
+
+### v3: Full platform
+
+- kind/k3d support for K8s apps
+- Deployment validation
+- Behavioral baselines and regression detection
+- Integration with Gauntlet for CI/CD workflow testing
+- Integration with Beacon for post-deploy security scanning
