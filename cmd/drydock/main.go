@@ -98,7 +98,8 @@ Run flags:
   --json                    Output results as JSON
   --ci                      CI mode: plain-text output, writes JUnit XML to artifacts dir
   --skip-teardown           Leave backends and fixtures running after the run (or set DRYDOCK_SKIP_TEARDOWN=1)
-  --keep                    Alias for --skip-teardown`)
+  --keep                    Alias for --skip-teardown
+  --beacon-args <args>      Extra args injected into every beacon assertion (e.g. '--log-level debug')`)
 }
 
 func fatalf(format string, args ...any) {
@@ -152,14 +153,19 @@ func cmdRun(args []string) {
 	ciMode := fs.Bool("ci", false, "CI mode: plain-text output, writes JUnit XML to artifacts dir")
 	skipTeardown := fs.Bool("skip-teardown", false, "do not destroy backends/fixtures after the run")
 	keep := fs.Bool("keep", false, "alias for --skip-teardown")
+	beaconArgs := fs.String("beacon-args", "", "extra args to inject into every beacon assertion (e.g. '--log-level debug')")
 
 	_ = fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fatalf("usage: drydock run [--tags <tags>] [--matrix <key=val,...>] <scenario-path>")
+		fatalf("usage: drydock run [--tags <tags>] [--matrix <key=val,...>] <scenario-path> [<path>...]")
 	}
 
-	scenarios := loadScenarios(fs.Arg(0))
+	// Support multiple positional arguments: each can be a file or directory.
+	var scenarios []*scenario.Scenario
+	for i := 0; i < fs.NArg(); i++ {
+		scenarios = append(scenarios, loadScenarios(fs.Arg(i))...)
+	}
 
 	// Filter by tags (include).
 	if *tags != "" {
@@ -227,6 +233,16 @@ func cmdRun(args []string) {
 	if *fixedPorts {
 		for _, s := range scenarios {
 			s.FixedPorts = true
+		}
+	}
+
+	// Inject --beacon-args into every scenario's env for the assertion runner.
+	if *beaconArgs != "" {
+		for _, s := range scenarios {
+			if s.Env == nil {
+				s.Env = make(map[string]string)
+			}
+			s.Env["DRYDOCK_BEACON_EXTRA_ARGS"] = *beaconArgs
 		}
 	}
 

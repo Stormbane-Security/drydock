@@ -1,0 +1,35 @@
+# Tier A: GitHub-hosted runner only. Copy to tier-a-hosted.yaml (or run with an explicit path).
+#
+# Prereqs: gh CLI authenticated; sacrificial lab repo with a workflow_dispatch workflow.
+#   export DRYDOCK_LAB_REPO=owner/lab-repo
+#   export DRYDOCK_LAB_WORKFLOW=drydock-smoke.yml   # workflow file name in default branch
+#
+# Optional: ingest + assert on a local snapshot with github-collector:
+#   ghcollect ingest -repo "$DRYDOCK_LAB_REPO" -out ./lab-data -enrich-api
+# Point ghcollect target at manifest path under lab-data/<snapshot_id>/manifest.json
+
+name: github-actions-lab-tier-a-hosted
+description: Tier A lab — trigger workflow on GitHub-hosted runners
+tags: [github-actions, lab, tier-a]
+
+backend:
+  type: github-actions
+  repo: ${DRYDOCK_LAB_REPO}
+  workflow: ${DRYDOCK_LAB_WORKFLOW}
+  ref: main
+  trigger: workflow_dispatch
+
+commands:
+  - name: noop
+    run: "true"
+
+assertions:
+  - name: workflow-succeeded
+    type: github-run
+    expect:
+      conclusion: success
+
+# Lateral / follow-on steps (run only if commands + assertions pass):
+# post_exploit:
+#   - name: list-org-repos
+#     run: gh repo list my-org --limit 5

@@ -194,8 +194,9 @@ func (b *Backend) QueryPorts(ctx context.Context, mappings []PortMapping) error 
 		// Docker compose port command needs --protocol flag for UDP,
 		// and the container port without the /udp suffix.
 		containerPort := m.ContainerPort
+		isUDP := strings.HasSuffix(containerPort, "/udp")
 		var args []string
-		if strings.HasSuffix(containerPort, "/udp") {
+		if isUDP {
 			containerPort = strings.TrimSuffix(containerPort, "/udp")
 			args = []string{"port", "--protocol", "udp", m.Service, containerPort}
 		} else {
@@ -208,12 +209,52 @@ func (b *Backend) QueryPorts(ctx context.Context, mappings []PortMapping) error 
 		}
 		// Output is like "0.0.0.0:56789\n" — extract just the port.
 		addr := strings.TrimSpace(stdout)
+		actualPort := ""
 		if idx := strings.LastIndex(addr, ":"); idx >= 0 {
-			actualPort := addr[idx+1:]
+			actualPort = addr[idx+1:]
+		}
+
+		// Docker Desktop sometimes returns port 0 for ephemeral UDP mappings.
+		// Fall back to docker inspect to read the actual binding.
+		if actualPort == "" || actualPort == "0" {
+			inspectPort, inspectErr := b.queryPortViaInspect(ctx, m.Service, containerPort, isUDP)
+			if inspectErr == nil && inspectPort != "" && inspectPort != "0" {
+				actualPort = inspectPort
+			}
+		}
+
+		if actualPort != "" && actualPort != "0" {
 			b.portSubs[m.IntendedHost] = actualPort
 		}
 	}
 	return nil
+}
+
+// queryPortViaInspect uses docker inspect to read port bindings directly from
+// the container's NetworkSettings. This handles cases where docker compose port
+// fails or returns 0 (common with ephemeral UDP mappings on Docker Desktop).
+func (b *Backend) queryPortViaInspect(ctx context.Context, service, containerPort string, isUDP bool) (string, error) {
+	proto := "tcp"
+	if isUDP {
+		proto = "udp"
+	}
+	// Get the container ID for this service.
+	stdout, _, err := b.run(ctx, "ps", "-q", service)
+	if err != nil {
+		return "", err
+	}
+	containerID := strings.TrimSpace(stdout)
+	if containerID == "" {
+		return "", fmt.Errorf("no container found for service %s", service)
+	}
+	// Use docker inspect with Go template to extract the host port.
+	tmpl := fmt.Sprintf(`{{(index (index .NetworkSettings.Ports "%s/%s") 0).HostPort}}`, containerPort, proto)
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", tmpl, containerID)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("docker inspect: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // PortSubs returns the port substitution map (intendedHost → actualHost).

@@ -1,0 +1,11 @@
+# Reference workflow — copy into your lab repo as e.g. drydock-self-hosted-smoke.yml
+name: drydock self-hosted smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, drydock-lab]
+    steps:
+      - run: echo "drydock tier-b ok"

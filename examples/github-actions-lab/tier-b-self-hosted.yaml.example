@@ -1,0 +1,43 @@
+# Tier B: Docker self-hosted runner + workflow on that runner (hybrid backend).
+# Copy beside runner.compose.yaml and customize.
+#
+# Prereqs:
+#   export DRYDOCK_LAB_REPO=owner/lab-repo
+#   export DRYDOCK_LAB_WORKFLOW=drydock-self-hosted-smoke.yml
+#   export RUNNER_ACCESS_TOKEN=...   # classic PAT with repo + admin:org scope, or fine-grained with Actions RW
+#   export RUNNER_REPO_URL=https://github.com/${DRYDOCK_LAB_REPO}
+#
+# Install the workflow from workflows/drydock-self-hosted-smoke.yml into the lab repo
+# (runs-on labels must match LABELS below).
+
+name: github-actions-lab-tier-b-self-hosted
+description: Tier B lab — compose runner plus GitHub Actions workflow
+tags: [github-actions, lab, tier-b]
+
+backend:
+  type: hybrid
+  compose_file: runner.compose.yaml
+  repo: ${DRYDOCK_LAB_REPO}
+  workflow: ${DRYDOCK_LAB_WORKFLOW}
+  ref: main
+  trigger: workflow_dispatch
+
+# Runner container reads REPO_URL / ACCESS_TOKEN from the environment.
+env:
+  RUNNER_REPO_URL: ${RUNNER_REPO_URL}
+  RUNNER_ACCESS_TOKEN: ${RUNNER_ACCESS_TOKEN}
+
+ready:
+  cmd: test "$(gh api "repos/${DRYDOCK_LAB_REPO}/actions/runners" --jq .total_count)" -gt 0
+  timeout: 5m
+  interval: 15s
+
+commands:
+  - name: noop
+    run: "true"
+
+assertions:
+  - name: workflow-succeeded
+    type: github-run
+    expect:
+      conclusion: success

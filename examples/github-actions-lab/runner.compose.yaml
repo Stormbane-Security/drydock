@@ -1,0 +1,12 @@
+# Compose stack for Tier B: registers a self-hosted runner against RUNNER_REPO_URL.
+# Uses myoung34/github-runner (documented pattern). Requires RUNNER_ACCESS_TOKEN and RUNNER_REPO_URL.
+
+services:
+  github-runner:
+    image: myoung34/github-runner:latest
+    environment:
+      REPO_URL: ${RUNNER_REPO_URL}
+      RUNNER_NAME_PREFIX: drydock-lab
+      ACCESS_TOKEN: ${RUNNER_ACCESS_TOKEN}
+      LABELS: drydock-lab,self-hosted
+    restart: unless-stopped
