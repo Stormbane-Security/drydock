@@ -117,3 +117,38 @@ Nobody combines deploy + functional tests + fault injection + behavioral observa
 - Behavioral baselines and regression detection
 - Integration with Gauntlet for CI/CD workflow testing
 - Integration with Beacon for post-deploy security scanning
+
+---
+
+## v3+: AI-powered debugger / sandbox verifier
+
+### Architecture
+- **Ingestion**: repo, tickets/specs, tests, logs/traces, API schemas, DB schema, past incidents
+- **Reasoning engine**: maps code to intended behavior, identifies high-risk paths, creates invariants
+- **Execution layer**: sandbox runs, targeted tests, fuzzing, failure simulation, state transition comparison
+- **Repair layer**: proposes patches, runs regression, produces diff + confidence + risk notes
+- **Human gate**: only for medium/high-risk fixes; low-risk may auto-commit
+
+### Best product shape
+Not "debug any app" but narrowed to:
+- Backend/API logic debugger
+- Test generation + bug localization
+- PR reviewer for AI-generated code
+- Sandbox verifier for generated apps
+- Framework-specific (Rails, Django, Next.js, Go services)
+
+### What it catches well
+- Off-by-one, branching mistakes
+- Missing nil/null handling, state update bugs
+- Incorrect authorization checks, stale cache logic
+- Duplicate event processing, wrong retry semantics
+- Missing transaction boundaries, bad validation ordering
+- Broken async flows, API contract mismatches
+
+### What it struggles with
+- Vague product requirements
+- Financial correctness edge cases
+- Complex concurrency bugs
+- Subtle security design flaws
+- Emergent cross-service bugs
+- Undocumented business-policy exceptions
