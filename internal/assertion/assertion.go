@@ -496,6 +496,12 @@ func checkBeacon(ctx context.Context, a scenario.Assertion, baseDir string, env 
 	// ── Feature: Coverage Report ─────────────────────────────────────────
 	result.Detail = beaconCoverageReport(findings, expectations)
 
+	// Capture beacon's stderr (debug/verbose output) in the artifact
+	// so it's available for debugging scanner dispatch, timing, etc.
+	if r.Stderr != "" {
+		result.Stderr = r.Stderr
+	}
+
 	return result
 }
 
